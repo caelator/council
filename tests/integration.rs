@@ -321,7 +321,7 @@ fn e2e_full_pipeline_with_mock_models() {
     assert!(!final_plan.trim().is_empty(), "final-plan.md is empty");
     assert!(final_plan.contains("Key-Value"), "final-plan.md doesn't contain expected content");
 
-    // Assert: run-summary.json exists and parses
+    // Assert: run-summary.json exists and parses with schema_version
     let summary_path = council_dir.join("run-summary.json");
     assert!(summary_path.exists(), "run-summary.json not found");
     let summary_text = fs::read_to_string(&summary_path).unwrap();
@@ -329,6 +329,15 @@ fn e2e_full_pipeline_with_mock_models() {
         .expect("run-summary.json is not valid JSON");
     assert!(summary.get("run_id").is_some(), "run-summary.json missing run_id");
     assert!(summary.get("converged").is_some(), "run-summary.json missing converged");
+    assert!(
+        summary.get("schema_version").is_some(),
+        "run-summary.json missing schema_version"
+    );
+    assert_eq!(
+        summary["schema_version"].as_u64().unwrap(),
+        1,
+        "run-summary.json schema_version should be 1"
+    );
 
     // Assert: convergence was detected (all-low critiques)
     let converged = summary["converged"].as_bool().unwrap_or(false);
@@ -370,6 +379,90 @@ fn e2e_full_pipeline_with_mock_models() {
             .expect("plans JSONL line is not valid JSON");
     }
 
+    // Assert: decision-log.json in round dirs has schema_version
+    for round in 1..=2 {
+        let round_dir = council_dir.join(format!("stage2-round{round}"));
+        let dlog_path = round_dir.join("decision-log.json");
+        if dlog_path.exists() {
+            let dlog_text = fs::read_to_string(&dlog_path).unwrap();
+            let dlog: serde_json::Value = serde_json::from_str(&dlog_text)
+                .expect("decision-log.json is not valid JSON");
+            assert!(
+                dlog.get("schema_version").is_some(),
+                "decision-log.json round {round} missing schema_version"
+            );
+        }
+    }
+
     // Clean up
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn e2e_resume_reads_v1_payload_without_schema_version() {
+    // Verify that resume mode gracefully handles a run-summary.json written
+    // without a schema_version field (v1 backward compatibility).
+    let council_bin = build_council();
+
+    let tmp = env::temp_dir().join(format!("council-e2e-resume-{}", std::process::id()));
+    let mock_dir = tmp.join("mock-bin");
+    let workdir = tmp.join("workdir");
+    let council_dir = tmp.join("council-output");
+
+    fs::create_dir_all(&mock_dir).unwrap();
+    fs::create_dir_all(&workdir).unwrap();
+    fs::create_dir_all(&council_dir).unwrap();
+
+    create_mock_scripts(&mock_dir);
+
+    // Write a v1 run-summary.json WITHOUT schema_version (simulates old format)
+    let v1_summary = r#"{
+        "run_id": "council-legacy",
+        "task": "Design a key-value store",
+        "rounds": 1,
+        "converged": false,
+        "council_dir": "/tmp/old",
+        "final_plan": "/tmp/old/final-plan.md"
+    }"#;
+    fs::write(council_dir.join("run-summary.json"), v1_summary).unwrap();
+
+    let original_path = env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", mock_dir.display(), original_path);
+
+    // Run in resume mode — should not crash, should log schema info
+    let output = Command::new(&council_bin)
+        .args([
+            "--resume",
+            workdir.to_str().unwrap(),
+            "Design a key-value store",
+        ])
+        .env("PATH", &new_path)
+        .env("COUNCIL_DIR", council_dir.to_str().unwrap())
+        .env("COUNCIL_ROUNDS", "1")
+        .env("COUNCIL_NAME", "resume-test")
+        .output()
+        .expect("failed to run council");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- resume stderr ---\n{}", stderr);
+
+    // Should complete successfully
+    assert!(stderr.contains("Council Complete"), "Council did not complete on resume");
+
+    // Should have logged that it loaded the v1 summary
+    assert!(
+        stderr.contains("[resume] Loaded run-summary.json"),
+        "Did not log loading of v1 run-summary.json"
+    );
+
+    // The new run-summary.json should now have schema_version
+    let new_summary_text = fs::read_to_string(council_dir.join("run-summary.json")).unwrap();
+    let new_summary: serde_json::Value = serde_json::from_str(&new_summary_text).unwrap();
+    assert_eq!(
+        new_summary["schema_version"].as_u64().unwrap(),
+        1,
+        "New run-summary.json should have schema_version=1"
+    );
+
     let _ = fs::remove_dir_all(&tmp);
 }

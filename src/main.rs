@@ -4,7 +4,11 @@ mod model;
 mod phase;
 mod trace;
 
-use critique::{is_converged, parse_critique, parse_decision_log, DecisionLog, Disposition, Severity, StructuredCritique};
+use critique::{
+    check_decision_log_version, is_converged, parse_critique, parse_decision_log,
+    read_context_payload, ContextPayload, DecisionLog, Disposition, Severity, StructuredCritique,
+    CURRENT_SCHEMA_VERSION,
+};
 use metrics::{
     aggregate_profiles, collect_critique_metrics, collect_output_metrics, format_recommendations,
     format_scorecard, load_metrics, recommend_roles, PhaseMetrics,
@@ -104,6 +108,22 @@ fn main() {
 
     if resume {
         eprintln!("[resume mode] Checking for existing artifacts in {}", council_dir.display());
+        // Try to load and validate the existing run-summary.json for schema negotiation
+        let summary_path = council_dir.join("run-summary.json");
+        if summary_path.exists() {
+            match read_context_payload(&summary_path) {
+                Ok(payload) => {
+                    eprintln!(
+                        "  [resume] Loaded run-summary.json (schema v{}, run_id={})",
+                        payload.schema_version, payload.run_id
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  [resume] Could not parse run-summary.json: {}", e);
+                    eprintln!("  [resume] Will overwrite with fresh run data");
+                }
+            }
+        }
     }
 
     fs::create_dir_all(&config.council_dir).expect("Failed to create council directory");
@@ -371,8 +391,9 @@ fn main() {
             round,
             decisions,
             material_change,
-            schema_version: 1,
+            schema_version: CURRENT_SCHEMA_VERSION,
         };
+        check_decision_log_version(&decision_log);
         write_artifact(
             &round_dir,
             "decision-log.json",
@@ -519,14 +540,15 @@ fn main() {
     eprintln!("\n{}", format_scorecard(&final_profiles));
 
     // ── Summary ───────────────────────────────────────────────────────
-    let summary = serde_json::json!({
-        "run_id": config.run_id,
-        "task": config.task,
-        "rounds": total_rounds,
-        "converged": converged,
-        "council_dir": config.council_dir.display().to_string(),
-        "final_plan": config.council_dir.join("final-plan.md").display().to_string(),
-    });
+    let summary = ContextPayload {
+        run_id: config.run_id.clone(),
+        task: config.task.clone(),
+        rounds: total_rounds,
+        converged,
+        council_dir: config.council_dir.display().to_string(),
+        final_plan: config.council_dir.join("final-plan.md").display().to_string(),
+        schema_version: CURRENT_SCHEMA_VERSION,
+    };
     write_artifact(
         &config.council_dir,
         "run-summary.json",

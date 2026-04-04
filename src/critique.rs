@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// The current schema version for all council artifacts.
+/// Bump this when making breaking changes to serialized formats.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CritiquePoint {
     pub issue: String,
@@ -19,7 +23,7 @@ pub enum Severity {
 }
 
 fn default_schema_version() -> u32 {
-    1
+    CURRENT_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,16 +65,72 @@ pub struct DecisionLog {
     pub schema_version: u32,
 }
 
+/// The context payload written as run-summary.json — the primary artifact
+/// that downstream consumers (and resume mode) read to understand a council run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPayload {
+    pub run_id: String,
+    pub task: String,
+    pub rounds: u32,
+    pub converged: bool,
+    pub council_dir: String,
+    pub final_plan: String,
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+}
+
+/// Read and validate a ContextPayload from a JSON file (run-summary.json).
+/// Handles schema version negotiation:
+/// - Missing version field: assumes v1
+/// - Version > CURRENT_SCHEMA_VERSION: warns but attempts best-effort parse
+/// - Version == CURRENT_SCHEMA_VERSION: passes through
+pub fn read_context_payload(path: &std::path::Path) -> Result<ContextPayload, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+
+    // First, try to extract the schema_version from raw JSON to warn early
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&content) {
+        match raw.get("schema_version") {
+            None => {
+                eprintln!(
+                    "  [info] read_context_payload: no schema_version in {}, assuming v1",
+                    path.display()
+                );
+            }
+            Some(v) => {
+                if let Some(ver) = v.as_u64() {
+                    if ver > CURRENT_SCHEMA_VERSION as u64 {
+                        eprintln!(
+                            "  [warn] read_context_payload: schema_version {} in {} is newer than supported ({}), attempting best-effort parse",
+                            ver, path.display(), CURRENT_SCHEMA_VERSION
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    serde_json::from_str::<ContextPayload>(&content)
+        .map_err(|e| format!("failed to parse {}: {}", path.display(), e))
+}
+
 /// Warn on unknown schema versions but don't fail — forward-compatible.
 fn check_schema_version(sc: &StructuredCritique, reviewer_role: &str) {
-    match sc.schema_version {
-        1 => {} // current version, pass through
-        v => {
-            eprintln!(
-                "  [warn] parse_critique: unknown schema_version {} for role '{}', proceeding anyway",
-                v, reviewer_role
-            );
-        }
+    if sc.schema_version > CURRENT_SCHEMA_VERSION {
+        eprintln!(
+            "  [warn] parse_critique: schema_version {} for role '{}' is newer than supported ({}), proceeding anyway",
+            sc.schema_version, reviewer_role, CURRENT_SCHEMA_VERSION
+        );
+    }
+}
+
+/// Warn on unknown schema versions in decision logs.
+pub fn check_decision_log_version(log: &DecisionLog) {
+    if log.schema_version > CURRENT_SCHEMA_VERSION {
+        eprintln!(
+            "  [warn] decision_log: schema_version {} (round {}) is newer than supported ({}), proceeding anyway",
+            log.schema_version, log.round, CURRENT_SCHEMA_VERSION
+        );
     }
 }
 
@@ -124,7 +184,7 @@ pub fn parse_critique(raw: &str, reviewer_role: &str) -> StructuredCritique {
             evidence: String::new(),
         }],
         things_to_keep: vec![],
-        schema_version: 1,
+        schema_version: CURRENT_SCHEMA_VERSION,
     }
 }
 
@@ -479,6 +539,68 @@ mod tests {
         let text = r#"prefix {"key": "value with { brace }"} suffix"#;
         let result = extract_brace_json(text);
         assert_eq!(result, Some(r#"{"key": "value with { brace }"}"#));
+    }
+
+    // -- ContextPayload schema negotiation tests --
+
+    #[test]
+    fn context_payload_without_version_defaults_to_current() {
+        let json = r#"{"run_id":"r1","task":"t","rounds":1,"converged":true,"council_dir":"/tmp","final_plan":"/tmp/p.md"}"#;
+        let payload: ContextPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn context_payload_with_current_version_parses() {
+        let json = format!(
+            r#"{{"run_id":"r1","task":"t","rounds":1,"converged":true,"council_dir":"/tmp","final_plan":"/tmp/p.md","schema_version":{}}}"#,
+            CURRENT_SCHEMA_VERSION
+        );
+        let payload: ContextPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(payload.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(payload.run_id, "r1");
+    }
+
+    #[test]
+    fn context_payload_with_future_version_parses_best_effort() {
+        let json = r#"{"run_id":"r1","task":"t","rounds":2,"converged":false,"council_dir":"/tmp","final_plan":"/tmp/p.md","schema_version":99,"unknown_field":"ignored"}"#;
+        // serde ignores unknown fields by default, so future payloads parse fine
+        let payload: ContextPayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.schema_version, 99);
+        assert_eq!(payload.rounds, 2);
+    }
+
+    #[test]
+    fn read_context_payload_from_file() {
+        let dir = std::env::temp_dir().join(format!("council-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("run-summary.json");
+        std::fs::write(&path, r#"{"run_id":"test","task":"t","rounds":1,"converged":true,"council_dir":"/tmp","final_plan":"/tmp/p.md"}"#).unwrap();
+
+        let payload = read_context_payload(&path).unwrap();
+        assert_eq!(payload.run_id, "test");
+        assert_eq!(payload.schema_version, CURRENT_SCHEMA_VERSION);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_context_payload_missing_file_errors() {
+        let path = std::path::PathBuf::from("/tmp/nonexistent-council-test/summary.json");
+        let result = read_context_payload(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn current_schema_version_constant_is_1() {
+        assert_eq!(CURRENT_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn decision_log_with_future_version_parses() {
+        let json = r#"{"round":1,"decisions":[],"material_change":false,"schema_version":42}"#;
+        let log: DecisionLog = serde_json::from_str(json).unwrap();
+        assert_eq!(log.schema_version, 42);
     }
 }
 
