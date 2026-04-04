@@ -1,0 +1,519 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CritiquePoint {
+    pub issue: String,
+    pub severity: Severity,
+    pub why_it_matters: String,
+    pub suggested_delta: String,
+    #[serde(default)]
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    High,
+    Medium,
+    Low,
+}
+
+fn default_schema_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredCritique {
+    pub reviewer_role: String,
+    pub critiques: Vec<CritiquePoint>,
+    #[serde(default)]
+    pub things_to_keep: Vec<String>,
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Disposition {
+    Accept,
+    Partial,
+    Reject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionEntry {
+    pub issue: String,
+    pub severity: Severity,
+    pub disposition: Disposition,
+    pub rationale: String,
+    /// Which critic originated this issue (e.g. "claude", "gemini").
+    /// Extracted from [model] tags in the decision log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionLog {
+    pub round: u32,
+    pub decisions: Vec<DecisionEntry>,
+    pub material_change: bool,
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+}
+
+/// Warn on unknown schema versions but don't fail — forward-compatible.
+fn check_schema_version(sc: &StructuredCritique, reviewer_role: &str) {
+    match sc.schema_version {
+        1 => {} // current version, pass through
+        v => {
+            eprintln!(
+                "  [warn] parse_critique: unknown schema_version {} for role '{}', proceeding anyway",
+                v, reviewer_role
+            );
+        }
+    }
+}
+
+/// Try to parse a structured critique from model output.
+/// Uses a multi-strategy approach to handle markdown-fenced JSON, raw JSON, and
+/// brace-matched JSON. Falls back to wrapping raw text only as a last resort.
+pub fn parse_critique(raw: &str, reviewer_role: &str) -> StructuredCritique {
+    // Strategy 1: Extract from ```json ... ``` code fence
+    if let Some(json_str) = extract_fenced_json(raw) {
+        if let Ok(mut sc) = serde_json::from_str::<StructuredCritique>(json_str) {
+            if sc.reviewer_role.is_empty() {
+                sc.reviewer_role = reviewer_role.to_string();
+            }
+            check_schema_version(&sc, reviewer_role);
+            return sc;
+        }
+    }
+
+    // Strategy 2: Try deserializing the entire raw text directly
+    if let Ok(mut sc) = serde_json::from_str::<StructuredCritique>(raw.trim()) {
+        if sc.reviewer_role.is_empty() {
+            sc.reviewer_role = reviewer_role.to_string();
+        }
+        check_schema_version(&sc, reviewer_role);
+        return sc;
+    }
+
+    // Strategy 3: Brace-matching to find outermost { ... } block
+    if let Some(json_str) = extract_brace_json(raw) {
+        if let Ok(mut sc) = serde_json::from_str::<StructuredCritique>(json_str) {
+            if sc.reviewer_role.is_empty() {
+                sc.reviewer_role = reviewer_role.to_string();
+            }
+            check_schema_version(&sc, reviewer_role);
+            return sc;
+        }
+    }
+
+    // All strategies failed — fall back to unstructured wrapper
+    eprintln!(
+        "  [warn] parse_critique: all JSON strategies failed for role '{}', falling back to unstructured wrapper",
+        reviewer_role
+    );
+    StructuredCritique {
+        reviewer_role: reviewer_role.to_string(),
+        critiques: vec![CritiquePoint {
+            issue: "Unstructured critique (model did not return valid JSON)".into(),
+            severity: Severity::Medium,
+            why_it_matters: "Review manually".into(),
+            suggested_delta: raw.to_string(),
+            evidence: String::new(),
+        }],
+        things_to_keep: vec![],
+        schema_version: 1,
+    }
+}
+
+/// Check whether remaining critiques are all low severity (convergence signal).
+/// Includes defense-in-depth: if the critique looks like a fallback wrapper but the
+/// suggested_delta contains valid JSON with all-low critiques, use those severities.
+pub fn is_converged(critique: &StructuredCritique) -> bool {
+    // Fast path: normal parsed critique
+    let all_low = critique
+        .critiques
+        .iter()
+        .all(|c| matches!(c.severity, Severity::Low));
+
+    if all_low {
+        return true;
+    }
+
+    // Defense-in-depth: detect fallback wrapper and try to recover severities
+    if critique.critiques.len() == 1
+        && critique.critiques[0].issue.starts_with("Unstructured critique")
+    {
+        let raw = &critique.critiques[0].suggested_delta;
+        // Try all extraction strategies on the raw text embedded in the fallback
+        let candidate = extract_fenced_json(raw)
+            .and_then(|s| serde_json::from_str::<StructuredCritique>(s).ok())
+            .or_else(|| serde_json::from_str::<StructuredCritique>(raw.trim()).ok())
+            .or_else(|| {
+                extract_brace_json(raw)
+                    .and_then(|s| serde_json::from_str::<StructuredCritique>(s).ok())
+            });
+
+        if let Some(sc) = candidate {
+            return sc
+                .critiques
+                .iter()
+                .all(|c| matches!(c.severity, Severity::Low));
+        }
+    }
+
+    false
+}
+
+/// Parse decision entries from the Codex deliberation/revision output.
+/// Looks for lines matching: `- ACCEPT|PARTIAL|REJECT: [model] <issue> -- <rationale>`
+/// The `[model]` tag is optional for backward compatibility.
+pub fn parse_decision_log(revision_text: &str) -> Vec<DecisionEntry> {
+    let mut entries = Vec::new();
+    // Track current section source: lines under "### Claude" or "### Gemini" headers
+    let mut section_source: Option<String> = None;
+
+    for line in revision_text.lines() {
+        // Detect section headers like "### Claude (conceptual-risk)" or "### Gemini"
+        let trimmed_line = line.trim();
+        if trimmed_line.starts_with("###") {
+            let header = trimmed_line.trim_start_matches('#').trim().to_lowercase();
+            if header.starts_with("claude") {
+                section_source = Some("claude".into());
+            } else if header.starts_with("gemini") {
+                section_source = Some("gemini".into());
+            } else if header.starts_with("codex") {
+                section_source = Some("codex".into());
+            } else {
+                // Unknown section — don't reset, could be unrelated header
+            }
+            continue;
+        }
+
+        let trimmed = trimmed_line.trim_start_matches('-').trim();
+        // Match ACCEPT: / PARTIAL: / REJECT: at the start
+        let (disposition, rest) = if let Some(rest) = strip_prefix_ci(trimmed, "ACCEPT:") {
+            (Disposition::Accept, rest)
+        } else if let Some(rest) = strip_prefix_ci(trimmed, "PARTIAL:") {
+            (Disposition::Partial, rest)
+        } else if let Some(rest) = strip_prefix_ci(trimmed, "REJECT:") {
+            (Disposition::Reject, rest)
+        } else {
+            continue;
+        };
+
+        let rest = rest.trim();
+
+        // Extract optional [model] tag at the start of the issue
+        let (source_model, rest) = extract_source_tag(rest, &section_source);
+
+        // Split on " -- " or " - " for issue/rationale separation
+        let (issue, rationale) = if let Some(idx) = rest.find(" -- ") {
+            (rest[..idx].trim().to_string(), rest[idx + 4..].trim().to_string())
+        } else if let Some(idx) = rest.find(" - ") {
+            (rest[..idx].trim().to_string(), rest[idx + 3..].trim().to_string())
+        } else {
+            (rest.to_string(), String::new())
+        };
+
+        if issue.is_empty() {
+            continue;
+        }
+
+        // Infer severity from disposition (REJECT = high, PARTIAL = medium, ACCEPT = low)
+        let severity = match disposition {
+            Disposition::Reject => Severity::High,
+            Disposition::Partial => Severity::Medium,
+            Disposition::Accept => Severity::Low,
+        };
+
+        entries.push(DecisionEntry {
+            issue,
+            severity,
+            disposition,
+            rationale,
+            source_model,
+        });
+    }
+    entries
+}
+
+/// Extract a `[model]` tag from the start of text, falling back to section source.
+fn extract_source_tag<'a>(text: &'a str, section_source: &Option<String>) -> (Option<String>, &'a str) {
+    if text.starts_with('[') {
+        if let Some(end) = text.find(']') {
+            let tag = text[1..end].trim().to_lowercase();
+            if tag == "claude" || tag == "gemini" || tag == "codex" {
+                return (Some(tag), text[end + 1..].trim());
+            }
+        }
+    }
+    (section_source.clone(), text)
+}
+
+/// Case-insensitive prefix strip: returns the remainder if `text` starts with `prefix` (ignoring case).
+fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    if text.len() >= prefix.len()
+        && text[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        Some(&text[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Extract JSON from a ```json ... ``` fenced code block.
+fn extract_fenced_json(text: &str) -> Option<&str> {
+    let start = text.find("```json")?;
+    let content_start = start + 7;
+    // Skip optional newline after ```json
+    let content_start = if text[content_start..].starts_with('\n') {
+        content_start + 1
+    } else {
+        content_start
+    };
+    let end = text[content_start..].find("```")?;
+    Some(text[content_start..content_start + end].trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_json() -> String {
+        r#"{"reviewer_role":"test","critiques":[{"issue":"test issue","severity":"low","why_it_matters":"reason","suggested_delta":"fix it","evidence":""}],"things_to_keep":["good stuff"]}"#.to_string()
+    }
+
+    #[test]
+    fn parse_critique_from_fenced_json() {
+        let raw = format!("Here is my review:\n```json\n{}\n```\nDone.", sample_json());
+        let result = parse_critique(&raw, "test-role");
+        assert_eq!(result.critiques.len(), 1);
+        assert_eq!(result.critiques[0].issue, "test issue");
+        assert!(matches!(result.critiques[0].severity, Severity::Low));
+    }
+
+    #[test]
+    fn parse_critique_from_raw_json() {
+        let raw = sample_json();
+        let result = parse_critique(&raw, "test-role");
+        assert_eq!(result.critiques.len(), 1);
+        assert_eq!(result.critiques[0].issue, "test issue");
+    }
+
+    #[test]
+    fn parse_critique_from_brace_match() {
+        let raw = format!("Some preamble text\n{}\nSome trailing text", sample_json());
+        let result = parse_critique(&raw, "test-role");
+        assert_eq!(result.critiques.len(), 1);
+        assert_eq!(result.critiques[0].issue, "test issue");
+    }
+
+    #[test]
+    fn parse_critique_fallback_on_garbage() {
+        let result = parse_critique("This is not JSON at all", "test-role");
+        assert_eq!(result.critiques.len(), 1);
+        assert!(result.critiques[0].issue.starts_with("Unstructured critique"));
+    }
+
+    #[test]
+    fn is_converged_all_low() {
+        let sc = StructuredCritique {
+            reviewer_role: "test".into(),
+            critiques: vec![CritiquePoint {
+                issue: "minor".into(),
+                severity: Severity::Low,
+                why_it_matters: "".into(),
+                suggested_delta: "".into(),
+                evidence: "".into(),
+            }],
+            things_to_keep: vec![],
+            schema_version: 1,
+        };
+        assert!(is_converged(&sc));
+    }
+
+    #[test]
+    fn is_converged_with_high() {
+        let sc = StructuredCritique {
+            reviewer_role: "test".into(),
+            critiques: vec![CritiquePoint {
+                issue: "big".into(),
+                severity: Severity::High,
+                why_it_matters: "".into(),
+                suggested_delta: "".into(),
+                evidence: "".into(),
+            }],
+            things_to_keep: vec![],
+            schema_version: 1,
+        };
+        assert!(!is_converged(&sc));
+    }
+
+    #[test]
+    fn is_converged_defense_in_depth_recovers_from_fallback() {
+        // Simulate a fallback wrapper where the raw text actually contains valid all-low JSON
+        let inner_json = r#"{"reviewer_role":"test","critiques":[{"issue":"minor","severity":"low","why_it_matters":"","suggested_delta":"","evidence":""}],"things_to_keep":[]}"#;
+        let sc = StructuredCritique {
+            reviewer_role: "test".into(),
+            critiques: vec![CritiquePoint {
+                issue: "Unstructured critique (model did not return valid JSON)".into(),
+                severity: Severity::Medium,
+                why_it_matters: "Review manually".into(),
+                suggested_delta: inner_json.to_string(),
+                evidence: String::new(),
+            }],
+            things_to_keep: vec![],
+            schema_version: 1,
+        };
+        assert!(is_converged(&sc));
+    }
+
+    #[test]
+    fn parse_decision_log_extracts_entries() {
+        let text = r#"## Decision Log
+- ACCEPT: Missing error handling -- Already addressed in revised plan
+- PARTIAL: Complexity in auth flow -- Simplified but kept core structure
+- REJECT: Remove caching entirely -- Caching is essential for performance
+
+## Revised Plan
+..."#;
+        let entries = parse_decision_log(text);
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(entries[0].disposition, Disposition::Accept));
+        assert_eq!(entries[0].issue, "Missing error handling");
+        assert_eq!(entries[0].rationale, "Already addressed in revised plan");
+        assert!(matches!(entries[1].disposition, Disposition::Partial));
+        assert!(matches!(entries[2].disposition, Disposition::Reject));
+        assert_eq!(entries[2].issue, "Remove caching entirely");
+    }
+
+    #[test]
+    fn parse_decision_log_extracts_source_tags() {
+        let text = r#"## Decision Log
+### Claude (conceptual-risk)
+- ACCEPT: Missing error handling -- Already addressed
+- REJECT: Coupling issue -- Not a real problem
+
+### Gemini (implementation-risk)
+- PARTIAL: Scaling concern -- Added connection pool
+
+## Revised Plan
+..."#;
+        let entries = parse_decision_log(text);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].source_model.as_deref(), Some("claude"));
+        assert_eq!(entries[1].source_model.as_deref(), Some("claude"));
+        assert_eq!(entries[2].source_model.as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn parse_decision_log_extracts_inline_tags() {
+        let text = r#"## Decision Log
+- ACCEPT: [claude] Missing error handling -- Fixed
+- PARTIAL: [gemini] Scaling issue -- Added pool
+"#;
+        let entries = parse_decision_log(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].source_model.as_deref(), Some("claude"));
+        assert_eq!(entries[0].issue, "Missing error handling");
+        assert_eq!(entries[1].source_model.as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn parse_decision_log_empty_on_no_entries() {
+        let entries = parse_decision_log("No decisions here, just text.");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn extract_fenced_json_handles_newline_after_fence() {
+        let text = "```json\n{\"key\": \"value\"}\n```";
+        let result = extract_fenced_json(text);
+        assert_eq!(result, Some("{\"key\": \"value\"}"));
+    }
+
+    #[test]
+    fn parse_critique_without_version_defaults_to_1() {
+        let raw = sample_json(); // sample_json has no schema_version field
+        let result = parse_critique(&raw, "test-role");
+        assert_eq!(result.schema_version, 1);
+    }
+
+    #[test]
+    fn parse_critique_with_version_1_works() {
+        let raw = r#"{"reviewer_role":"test","schema_version":1,"critiques":[{"issue":"test issue","severity":"low","why_it_matters":"reason","suggested_delta":"fix it","evidence":""}],"things_to_keep":["good stuff"]}"#;
+        let result = parse_critique(raw, "test-role");
+        assert_eq!(result.schema_version, 1);
+        assert_eq!(result.critiques.len(), 1);
+        assert_eq!(result.critiques[0].issue, "test issue");
+    }
+
+    #[test]
+    fn parse_critique_with_unknown_version_warns_but_succeeds() {
+        let raw = r#"{"reviewer_role":"test","schema_version":99,"critiques":[{"issue":"future issue","severity":"low","why_it_matters":"reason","suggested_delta":"fix it","evidence":""}],"things_to_keep":[]}"#;
+        let result = parse_critique(raw, "test-role");
+        assert_eq!(result.schema_version, 99);
+        assert_eq!(result.critiques.len(), 1);
+        assert_eq!(result.critiques[0].issue, "future issue");
+    }
+
+    #[test]
+    fn decision_log_without_version_defaults_to_1() {
+        let json = r#"{"round":1,"decisions":[],"material_change":false}"#;
+        let log: DecisionLog = serde_json::from_str(json).unwrap();
+        assert_eq!(log.schema_version, 1);
+    }
+
+    #[test]
+    fn decision_log_with_version_works() {
+        let json = r#"{"round":1,"decisions":[],"material_change":false,"schema_version":1}"#;
+        let log: DecisionLog = serde_json::from_str(json).unwrap();
+        assert_eq!(log.schema_version, 1);
+    }
+
+    #[test]
+    fn extract_brace_json_handles_strings_with_braces() {
+        let text = r#"prefix {"key": "value with { brace }"} suffix"#;
+        let result = extract_brace_json(text);
+        assert_eq!(result, Some(r#"{"key": "value with { brace }"}"#));
+    }
+}
+
+/// Extract JSON by brace-matching the outermost { ... } block.
+fn extract_brace_json(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    for (i, ch) in text[start..].char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escape_next = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}

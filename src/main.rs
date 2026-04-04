@@ -1,0 +1,738 @@
+mod critique;
+mod metrics;
+mod model;
+mod phase;
+mod trace;
+
+use critique::{is_converged, parse_critique, parse_decision_log, DecisionLog, Disposition, Severity, StructuredCritique};
+use metrics::{
+    aggregate_profiles, collect_critique_metrics, collect_output_metrics, format_recommendations,
+    format_scorecard, load_metrics, recommend_roles, PhaseMetrics,
+};
+use model::{run_model, Model};
+use phase::fmt_prompt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use trace::{
+    append_jsonl, generate_run_id, iso_now, persona_assignment, LearningRecord, PlanRecord,
+    RunTrace,
+};
+
+struct Config {
+    workdir: PathBuf,
+    task: String,
+    max_rounds: u32,
+    council_dir: PathBuf,
+    run_id: String,
+    resume: bool,
+    trace_file: PathBuf,
+    plans_file: PathBuf,
+    learnings_file: PathBuf,
+    metrics_file: PathBuf,
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Support --resume or --context-file as args
+    let mut resume = std::env::var("COUNCIL_RESUME").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let mut context_file: Option<String> = None;
+    let mut real_args = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--resume" {
+            resume = true;
+        } else if args[i] == "--context-file" && i + 1 < args.len() {
+            context_file = Some(args[i+1].clone());
+            i += 1;
+        } else {
+            real_args.push(&args[i]);
+        }
+        i += 1;
+    }
+
+    if real_args.len() < 2 {
+        eprintln!("Usage: council [--resume] [--context-file <path>] <workdir> <task prompt>");
+        eprintln!("Optional env: COUNCIL_ROUNDS (default 2), COUNCIL_DIR, COUNCIL_NAME, COUNCIL_RESUME=1");
+        std::process::exit(1);
+    }
+
+    let workdir = PathBuf::from(real_args[0]);
+    if !workdir.is_dir() {
+        eprintln!("Workdir does not exist: {}", workdir.display());
+        std::process::exit(1);
+    }
+
+    let task: String = real_args[1..].iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
+    
+    // Read external context if provided
+    let external_context = if let Some(path) = context_file {
+        fs::read_to_string(&path).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to read context file {}: {}", path, e);
+            String::new()
+        })
+    } else {
+        String::new()
+    };
+    let max_rounds: u32 = std::env::var("COUNCIL_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+
+    let run_id = generate_run_id();
+    let slug = slugify(&task);
+    let name = std::env::var("COUNCIL_NAME").unwrap_or_else(|_| slug);
+
+    let council_dir = std::env::var("COUNCIL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workdir.join(".council").join(&name));
+
+    let memoryport = workdir.join("memoryport");
+
+    let config = Config {
+        workdir: workdir.clone(),
+        task: task.clone(),
+        max_rounds,
+        council_dir: council_dir.clone(),
+        run_id: run_id.clone(),
+        resume,
+        trace_file: memoryport.join("council-traces.jsonl"),
+        plans_file: memoryport.join("council-plans.jsonl"),
+        learnings_file: memoryport.join("council-learnings.jsonl"),
+        metrics_file: memoryport.join("council-metrics.jsonl"),
+    };
+
+    if resume {
+        eprintln!("[resume mode] Checking for existing artifacts in {}", council_dir.display());
+    }
+
+    fs::create_dir_all(&config.council_dir).expect("Failed to create council directory");
+    fs::create_dir_all(&memoryport).expect("Failed to create memoryport directory");
+
+    // Save task
+    write_artifact(&config.council_dir, "task.txt", &config.task);
+
+    // Check model availability
+    let models_available = [
+        (Model::Gemini, model::check_available(Model::Gemini)),
+        (Model::Claude, model::check_available(Model::Claude)),
+        (Model::Codex, model::check_available(Model::Codex)),
+    ];
+    for (m, available) in &models_available {
+        if *available {
+            eprintln!("  [ok] {} available", m.name());
+        } else {
+            eprintln!("  [!!] {} not found", m.name());
+        }
+    }
+
+    // ── Load historical metrics and print scorecard ────────────────────
+    let historical_metrics = load_metrics(&config.metrics_file);
+    if !historical_metrics.is_empty() {
+        let profiles = aggregate_profiles(&historical_metrics);
+        eprintln!("\n{}", format_scorecard(&profiles));
+
+        // Current hardcoded assignments
+        let current_assignments = vec![
+            (Model::Claude, "adversarial-reviewer/conceptual-risk", "deliberation"),
+            (Model::Gemini, "adversarial-reviewer/implementation-risk", "deliberation"),
+            (Model::Codex, "synthesis-owner", "deliberation"),
+            (Model::Gemini, "framing-controller", "framing"),
+            (Model::Gemini, "solution-scout", "brainstorming"),
+            (Model::Claude, "elegance-scout", "brainstorming"),
+            (Model::Codex, "feasibility-scout", "brainstorming"),
+            (Model::Codex, "build-lead", "handoff"),
+        ];
+        let recommendations = recommend_roles(&profiles, &current_assignments, 2, 0.2);
+        eprintln!("{}", format_recommendations(&recommendations));
+
+        if recommendations.iter().any(|r| r.confidence >= 0.5) {
+            eprintln!("  [!] High-confidence role swaps detected. Review before proceeding.\n");
+        }
+    } else {
+        eprintln!("\n  [info] No historical metrics found. Metrics will be collected this run.\n");
+    }
+
+    let mut run_metrics: Vec<PhaseMetrics> = Vec::new();
+    let mut personas = Vec::new();
+    let mut phases_completed = Vec::new();
+
+    // ── Stage 0: Framing ──────────────────────────────────────────────
+    eprintln!("\n═══ Stage 0: Framing ═══");
+    let framing = if config.resume {
+        if let Some(existing) = try_resume_artifact(&config.council_dir, "stage0-framing.md") {
+            eprintln!("  [resume] Loaded existing stage0-framing.md ({} bytes)", existing.len());
+            existing
+        } else {
+            let framing_prompt = fmt_prompt(
+                phase::FRAMING_PROMPT,
+                &[("task", &config.task), ("external_context", &external_context)],
+            );
+            let f = run_phase_model(Model::Gemini, &framing_prompt, &config.workdir, &config.council_dir, "stage0-framing");
+            write_artifact(&config.council_dir, "problem-brief.md", &f);
+            f
+        }
+    } else {
+        let framing_prompt = fmt_prompt(
+            phase::FRAMING_PROMPT,
+            &[("task", &config.task), ("external_context", &external_context)],
+        );
+        let f = run_phase_model(Model::Gemini, &framing_prompt, &config.workdir, &config.council_dir, "stage0-framing");
+        write_artifact(&config.council_dir, "problem-brief.md", &f);
+        f
+    };
+    run_metrics.push(collect_output_metrics(
+        &config.run_id, &iso_now(), Model::Gemini,
+        "framing-controller", "framing",
+        framing.len() as u32,
+        framing.len() > 20 && framing.contains("##"),
+    ));
+    phases_completed.push("framing".into());
+    personas.push(persona_assignment(
+        Model::Gemini,
+        "framing-controller",
+        "framing",
+    ));
+
+    // ── Stage 1: Brainstorming ────────────────────────────────────────
+    eprintln!("\n═══ Stage 1: Brainstorming ═══");
+    let stage1_dir = config.council_dir.join("stage1-brainstorm");
+    fs::create_dir_all(&stage1_dir).ok();
+
+    let brainstorm_plan = if config.resume {
+        if let Some(existing) = try_resume_artifact(&config.council_dir, "brainstorm-plan-v1.md") {
+            eprintln!("  [resume] Loaded existing brainstorm-plan-v1.md ({} bytes)", existing.len());
+            existing
+        } else {
+            run_brainstorm_stage(&config, &stage1_dir, &framing, &mut personas)
+        }
+    } else {
+        run_brainstorm_stage(&config, &stage1_dir, &framing, &mut personas)
+    };
+    phases_completed.push("brainstorming".into());
+
+    // ── Stage 2: Adversarial Deliberation ─────────────────────────────
+    eprintln!("\n═══ Stage 2: Adversarial Deliberation ═══");
+    let mut current_plan = brainstorm_plan;
+    let mut converged = false;
+    let mut total_rounds = 0u32;
+
+    // On resume, find the last completed round and load its plan
+    let resume_from_round = if config.resume {
+        let mut last_complete = 0u32;
+        for r in 1..=config.max_rounds {
+            let round_dir = config.council_dir.join(format!("stage2-round{r}"));
+            if let Some(rev) = try_resume_artifact(&round_dir, "codex-revision.md") {
+                eprintln!("  [resume] Found completed round {r} ({} bytes)", rev.len());
+                current_plan = rev;
+                last_complete = r;
+            } else {
+                break;
+            }
+        }
+        // Also check for the round-level plan artifact
+        for r in (1..=last_complete).rev() {
+            if let Some(bp) = try_resume_artifact(&config.council_dir, &format!("build-plan-round{r}.md")) {
+                current_plan = bp;
+                break;
+            }
+        }
+        last_complete
+    } else {
+        0
+    };
+
+    for round in 1..=config.max_rounds {
+        // Skip already-completed rounds on resume
+        if round <= resume_from_round {
+            total_rounds = round;
+            continue;
+        }
+        total_rounds = round;
+        let round_dir = config.council_dir.join(format!("stage2-round{round}"));
+        fs::create_dir_all(&round_dir).ok();
+        eprintln!("  ── Round {round}/{} ──", config.max_rounds);
+
+        // Claude: conceptual adversary
+        eprintln!("  → Claude: conceptual-adversary");
+        let claude_crit_prompt = fmt_prompt(
+            phase::CRITIQUE_PROMPT,
+            &[
+                ("role", "adversarial-reviewer/conceptual-risk"),
+                (
+                    "role_description",
+                    "Find conceptual flaws, ambiguity, hidden coupling, missing edge cases",
+                ),
+                ("plan", &current_plan),
+                ("task", &config.task),
+            ],
+        );
+        let claude_crit_raw = run_phase_model(
+            Model::Claude,
+            &claude_crit_prompt,
+            &config.workdir,
+            &round_dir,
+            "claude-critique",
+        );
+        let claude_critique =
+            parse_critique(&claude_crit_raw, "adversarial-reviewer/conceptual-risk");
+        write_artifact(
+            &round_dir,
+            "claude-critique.json",
+            &serde_json::to_string_pretty(&claude_critique).unwrap_or_default(),
+        );
+
+        // Gemini: novelty/risk adversary
+        eprintln!("  → Gemini: risk-adversary");
+        let gemini_crit_prompt = fmt_prompt(
+            phase::CRITIQUE_PROMPT,
+            &[
+                ("role", "adversarial-reviewer/implementation-risk"),
+                (
+                    "role_description",
+                    "Find implementation risks, complexity traps, scaling issues, missing validation",
+                ),
+                ("plan", &current_plan),
+                ("task", &config.task),
+            ],
+        );
+        let gemini_crit_raw = run_phase_model(
+            Model::Gemini,
+            &gemini_crit_prompt,
+            &config.workdir,
+            &round_dir,
+            "gemini-critique",
+        );
+        let gemini_critique =
+            parse_critique(&gemini_crit_raw, "adversarial-reviewer/implementation-risk");
+        write_artifact(
+            &round_dir,
+            "gemini-critique.json",
+            &serde_json::to_string_pretty(&gemini_critique).unwrap_or_default(),
+        );
+
+        // Check convergence before synthesis
+        let claude_converged = is_converged(&claude_critique);
+        let gemini_converged = is_converged(&gemini_critique);
+        let critique_count = claude_critique.critiques.len() + gemini_critique.critiques.len();
+        let high_count =
+            count_high_severity(&claude_critique) + count_high_severity(&gemini_critique);
+
+        eprintln!("  → Critiques: {critique_count} total, {high_count} high-severity");
+
+        if claude_converged && gemini_converged {
+            eprintln!("  → Converged: all critiques are low severity");
+            converged = true;
+
+            append_jsonl(
+                &config.learnings_file,
+                &LearningRecord {
+                    run_id: config.run_id.clone(),
+                    timestamp: iso_now(),
+                    kind: "convergence".into(),
+                    summary: format!("Converged after {round} deliberation round(s)"),
+                    task_type: "planning".into(),
+                    model: "all".into(),
+                    role: "deliberation".into(),
+                },
+            );
+            break;
+        }
+
+        // Codex: synthesis owner — process critiques and revise plan
+        eprintln!("  → Codex: synthesis-owner (revise plan)");
+        let combined_critiques = format!(
+            "## Claude (conceptual-risk)\n{}\n\n## Gemini (implementation-risk)\n{}",
+            serde_json::to_string_pretty(&claude_critique).unwrap_or_default(),
+            serde_json::to_string_pretty(&gemini_critique).unwrap_or_default()
+        );
+        let delib_prompt = fmt_prompt(
+            phase::DELIBERATION_LEAD_PROMPT,
+            &[
+                ("plan", &current_plan),
+                ("critiques", &combined_critiques),
+                ("task", &config.task),
+            ],
+        );
+        let revision = run_phase_model(
+            Model::Codex,
+            &delib_prompt,
+            &config.workdir,
+            &round_dir,
+            "codex-revision",
+        );
+
+        // Detect material change
+        let material_change =
+            revision.len().abs_diff(current_plan.len()) > current_plan.len() / 20 || high_count > 0;
+
+        let decisions = parse_decision_log(&revision);
+        let decision_log = DecisionLog {
+            round,
+            decisions,
+            material_change,
+            schema_version: 1,
+        };
+        write_artifact(
+            &round_dir,
+            "decision-log.json",
+            &serde_json::to_string_pretty(&decision_log).unwrap_or_default(),
+        );
+
+        // ── Collect per-model metrics for this round ────────────────
+        let ts = iso_now();
+        let decision_tuples: Vec<(String, Disposition, Severity)> = decision_log
+            .decisions
+            .iter()
+            .map(|d| (d.issue.clone(), d.disposition, d.severity))
+            .collect();
+
+        // Partition decisions by source model for accurate per-critic metrics
+        let claude_decisions: Vec<_> = decision_log
+            .decisions
+            .iter()
+            .filter(|d| d.source_model.as_deref() == Some("claude"))
+            .map(|d| (d.issue.clone(), d.disposition, d.severity))
+            .collect();
+        let gemini_decisions: Vec<_> = decision_log
+            .decisions
+            .iter()
+            .filter(|d| d.source_model.as_deref() == Some("gemini"))
+            .map(|d| (d.issue.clone(), d.disposition, d.severity))
+            .collect();
+
+        // Use source-partitioned decisions if available, fall back to fuzzy matching all
+        let claude_decs = if claude_decisions.is_empty() { &decision_tuples } else { &claude_decisions };
+        let gemini_decs = if gemini_decisions.is_empty() { &decision_tuples } else { &gemini_decisions };
+
+        run_metrics.push(collect_critique_metrics(
+            &config.run_id, &ts, Model::Claude,
+            "adversarial-reviewer/conceptual-risk", "deliberation",
+            &claude_critique, claude_decs,
+            claude_crit_raw.len() as u32,
+            !claude_critique.critiques.first()
+                .is_some_and(|c| c.issue.starts_with("Unstructured")),
+        ));
+        run_metrics.push(collect_critique_metrics(
+            &config.run_id, &ts, Model::Gemini,
+            "adversarial-reviewer/implementation-risk", "deliberation",
+            &gemini_critique, gemini_decs,
+            gemini_crit_raw.len() as u32,
+            !gemini_critique.critiques.first()
+                .is_some_and(|c| c.issue.starts_with("Unstructured")),
+        ));
+        run_metrics.push(collect_output_metrics(
+            &config.run_id, &ts, Model::Codex,
+            "synthesis-owner", "deliberation",
+            revision.len() as u32,
+            !decision_log.decisions.is_empty(),
+        ));
+
+        if !material_change && round > 1 {
+            eprintln!("  → No material change detected, treating as converged");
+            converged = true;
+            current_plan = revision;
+            break;
+        }
+
+        current_plan = revision;
+        write_artifact(
+            &config.council_dir,
+            &format!("build-plan-round{round}.md"),
+            &current_plan,
+        );
+    }
+
+    phases_completed.push("deliberation".into());
+
+    // ── Stage 3: Build Handoff ────────────────────────────────────────
+    eprintln!("\n═══ Stage 3: Build Handoff ═══");
+    let handoff = if config.resume {
+        if let Some(existing) = try_resume_artifact(&config.council_dir, "stage3-handoff.md") {
+            eprintln!("  [resume] Loaded existing stage3-handoff.md ({} bytes)", existing.len());
+            existing
+        } else {
+            let handoff_prompt = fmt_prompt(phase::HANDOFF_PROMPT, &[("plan", &current_plan), ("task", &config.task)]);
+            run_phase_model(Model::Codex, &handoff_prompt, &config.workdir, &config.council_dir, "stage3-handoff")
+        }
+    } else {
+        let handoff_prompt = fmt_prompt(phase::HANDOFF_PROMPT, &[("plan", &current_plan), ("task", &config.task)]);
+        run_phase_model(Model::Codex, &handoff_prompt, &config.workdir, &config.council_dir, "stage3-handoff")
+    };
+    run_metrics.push(collect_output_metrics(
+        &config.run_id, &iso_now(), Model::Codex,
+        "build-lead", "handoff",
+        handoff.len() as u32,
+        handoff.contains("## Implementation Checklist"),
+    ));
+    personas.push(persona_assignment(Model::Codex, "build-lead", "handoff"));
+
+    write_artifact(&config.council_dir, "final-plan.md", &handoff);
+    write_artifact(&config.council_dir, "build-plan-final.md", &current_plan);
+    phases_completed.push("handoff".into());
+
+    // ── Telemetry ─────────────────────────────────────────────────────
+    let ts = iso_now();
+    let models_used: Vec<String> = [Model::Gemini, Model::Claude, Model::Codex]
+        .iter()
+        .filter(|m| model::check_available(**m))
+        .map(|m| m.name().into())
+        .collect();
+
+    let run_trace = RunTrace {
+        run_id: config.run_id.clone(),
+        timestamp: ts.clone(),
+        task: config.task.clone(),
+        task_type: "planning".into(),
+        phases_completed,
+        models_used,
+        persona_assignments: personas,
+        rounds: total_rounds,
+        converged,
+        artifacts_dir: config.council_dir.display().to_string(),
+        final_plan_path: config.council_dir.join("final-plan.md").display().to_string(),
+    };
+    append_jsonl(&config.trace_file, &run_trace);
+
+    let plan_content =
+        fs::read_to_string(config.council_dir.join("final-plan.md")).unwrap_or_default();
+    let plan_record = PlanRecord {
+        run_id: config.run_id.clone(),
+        timestamp: ts,
+        task: config.task.clone(),
+        task_type: "planning".into(),
+        plan_markdown: plan_content,
+        artifacts_dir: config.council_dir.display().to_string(),
+    };
+    append_jsonl(&config.plans_file, &plan_record);
+
+    // ── Emit per-model metrics ─────────────────────────────────────────
+    for m in &run_metrics {
+        append_jsonl(&config.metrics_file, m);
+    }
+    eprintln!("  Metrics: {} records written to {}", run_metrics.len(), config.metrics_file.display());
+
+    // Print end-of-run scorecard with this run's data included
+    let mut all_metrics = historical_metrics;
+    all_metrics.extend(run_metrics);
+    let final_profiles = aggregate_profiles(&all_metrics);
+    eprintln!("\n{}", format_scorecard(&final_profiles));
+
+    // ── Summary ───────────────────────────────────────────────────────
+    let summary = serde_json::json!({
+        "run_id": config.run_id,
+        "task": config.task,
+        "rounds": total_rounds,
+        "converged": converged,
+        "council_dir": config.council_dir.display().to_string(),
+        "final_plan": config.council_dir.join("final-plan.md").display().to_string(),
+    });
+    write_artifact(
+        &config.council_dir,
+        "run-summary.json",
+        &serde_json::to_string_pretty(&summary).unwrap_or_default(),
+    );
+
+    eprintln!("\n═══ Council Complete ═══");
+    eprintln!("  Rounds: {total_rounds}, Converged: {converged}");
+    eprintln!(
+        "  Final plan: {}",
+        config.council_dir.join("final-plan.md").display()
+    );
+
+    // Print final plan path to stdout (for scripting)
+    println!("{}", config.council_dir.join("final-plan.md").display());
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+fn run_brainstorm_stage(
+    config: &Config,
+    stage1_dir: &Path,
+    framing: &str,
+    personas: &mut Vec<trace::PersonaAssignment>,
+) -> String {
+    // Gemini seeds the plan
+    eprintln!("  → Gemini: solution-scout (seed plan)");
+    let seed_prompt = fmt_prompt(
+        phase::BRAINSTORM_SEED_PROMPT,
+        &[("framing", framing), ("task", &config.task)],
+    );
+    let seed_plan = run_phase_model(
+        Model::Gemini,
+        &seed_prompt,
+        &config.workdir,
+        stage1_dir,
+        "gemini-seed",
+    );
+    personas.push(persona_assignment(Model::Gemini, "solution-scout", "brainstorming"));
+
+    // Claude contributes elegance/reframing
+    eprintln!("  → Claude: elegance-scout (contribute)");
+    let claude_contrib_prompt = fmt_prompt(
+        phase::BRAINSTORM_CONTRIBUTE_PROMPT,
+        &[
+            ("role", "elegance-scout"),
+            ("role_description", "Find hidden assumptions, simpler abstractions, and reframing opportunities"),
+            ("framing", framing),
+            ("plan", &seed_plan),
+            ("task", &config.task),
+        ],
+    );
+    let claude_contributions = run_phase_model(
+        Model::Claude,
+        &claude_contrib_prompt,
+        &config.workdir,
+        stage1_dir,
+        "claude-contribute",
+    );
+    personas.push(persona_assignment(Model::Claude, "elegance-scout", "brainstorming"));
+
+    // Codex contributes feasibility
+    eprintln!("  → Codex: feasibility-scout (contribute)");
+    let codex_contrib_prompt = fmt_prompt(
+        phase::BRAINSTORM_CONTRIBUTE_PROMPT,
+        &[
+            ("role", "feasibility-scout"),
+            ("role_description", "Check implementation realism, flag complexity risks, suggest simplifications"),
+            ("framing", framing),
+            ("plan", &seed_plan),
+            ("task", &config.task),
+        ],
+    );
+    let codex_contributions = run_phase_model(
+        Model::Codex,
+        &codex_contrib_prompt,
+        &config.workdir,
+        stage1_dir,
+        "codex-contribute",
+    );
+    personas.push(persona_assignment(Model::Codex, "feasibility-scout", "brainstorming"));
+
+    // Synthesize
+    eprintln!("  → Gemini: synthesizing contributions");
+    let synth_prompt = format!(
+        "You are the brainstorming lead synthesizing contributions into a revised plan.\n\n\
+         Original plan:\n{seed_plan}\n\n\
+         Elegance contributions:\n{claude_contributions}\n\n\
+         Feasibility contributions:\n{codex_contributions}\n\n\
+         Integrate the valuable suggestions. Produce the revised complete plan.\n\
+         Mark sections that changed with [CHANGED] tags."
+    );
+    let brainstorm_plan = run_phase_model(
+        Model::Gemini,
+        &synth_prompt,
+        &config.workdir,
+        stage1_dir,
+        "gemini-synthesis",
+    );
+    write_artifact(&config.council_dir, "brainstorm-plan-v1.md", &brainstorm_plan);
+    brainstorm_plan
+}
+
+/// Try to load an existing artifact for resume. Returns Some(content) if the file
+/// exists and has meaningful content (> 20 bytes, not a skip/error marker).
+fn try_resume_artifact(dir: &Path, name: &str) -> Option<String> {
+    let path = dir.join(name);
+    match fs::read_to_string(&path) {
+        Ok(content) if content.len() > 20 => {
+            // Reject error markers from failed model runs
+            if content.starts_with('[')
+                && !content.trim_start().starts_with('{')
+                && !content.trim_start().starts_with('#')
+            {
+                return None;
+            }
+            if content.contains("unavailable — skipped]")
+                || content.contains("produced no output]")
+            {
+                return None;
+            }
+            Some(content)
+        }
+        _ => None,
+    }
+}
+
+fn run_phase_model(
+    model: Model,
+    prompt: &str,
+    workdir: &Path,
+    output_dir: &Path,
+    artifact_prefix: &str,
+) -> String {
+    fs::create_dir_all(output_dir).ok();
+
+    // Save prompt
+    write_artifact(output_dir, &format!("{artifact_prefix}-prompt.txt"), prompt);
+
+    if !model::check_available(model) {
+        let msg = format!("[{} unavailable — skipped]", model.name());
+        eprintln!("    {msg}");
+        write_artifact(output_dir, &format!("{artifact_prefix}.md"), &msg);
+        return msg;
+    }
+
+    match run_model(model, prompt, workdir) {
+        Ok(output) => {
+            write_artifact(
+                output_dir,
+                &format!("{artifact_prefix}.stderr"),
+                &output.stderr,
+            );
+            let text = if output.success && !output.stdout.trim().is_empty() {
+                output.stdout
+            } else {
+                eprintln!(
+                    "    [{}] failed or empty output, using stderr as fallback",
+                    model.name()
+                );
+                if output.stderr.trim().is_empty() {
+                    format!("[{} produced no output]", model.name())
+                } else {
+                    format!("[{} failed]\nstderr:\n{}", model.name(), output.stderr)
+                }
+            };
+            write_artifact(output_dir, &format!("{artifact_prefix}.md"), &text);
+            text
+        }
+        Err(e) => {
+            let msg = format!("[{} error: {e}]", model.name());
+            eprintln!("    {msg}");
+            write_artifact(output_dir, &format!("{artifact_prefix}.md"), &msg);
+            msg
+        }
+    }
+}
+
+fn write_artifact(dir: &Path, name: &str, content: &str) {
+    let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    fs::write(&path, content).ok();
+}
+
+fn slugify(text: &str) -> String {
+    let slug: String = text
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+    if slug.len() > 64 {
+        slug[..64].trim_end_matches('-').to_string()
+    } else if slug.is_empty() {
+        "council-run".to_string()
+    } else {
+        slug
+    }
+}
+
+fn count_high_severity(critique: &StructuredCritique) -> usize {
+    critique
+        .critiques
+        .iter()
+        .filter(|c| matches!(c.severity, critique::Severity::High))
+        .count()
+}

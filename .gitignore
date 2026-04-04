@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock is included for binary crates
+# Cargo.lock
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
