@@ -10,8 +10,9 @@ use critique::{
     CURRENT_SCHEMA_VERSION,
 };
 use metrics::{
-    aggregate_profiles, collect_critique_metrics, collect_output_metrics, format_recommendations,
-    format_scorecard, load_metrics, recommend_roles, PhaseMetrics,
+    aggregate_profiles, collect_critique_metrics, collect_output_metrics, format_fit_report,
+    format_recommendations, format_scorecard, load_metrics, recommend_roles,
+    score_model_role_fit, PhaseMetrics,
 };
 use model::{run_model, Model};
 use phase::fmt_prompt;
@@ -224,10 +225,10 @@ fn main() {
             eprintln!("  [resume] Loaded existing brainstorm-plan-v1.md ({} bytes)", existing.len());
             existing
         } else {
-            run_brainstorm_stage(&config, &stage1_dir, &framing, &mut personas)
+            run_brainstorm_stage(&config, &stage1_dir, &framing, &mut personas, &mut run_metrics)
         }
     } else {
-        run_brainstorm_stage(&config, &stage1_dir, &framing, &mut personas)
+        run_brainstorm_stage(&config, &stage1_dir, &framing, &mut personas, &mut run_metrics)
     };
     phases_completed.push("brainstorming".into());
 
@@ -539,6 +540,10 @@ fn main() {
     let final_profiles = aggregate_profiles(&all_metrics);
     eprintln!("\n{}", format_scorecard(&final_profiles));
 
+    // Print model-role fit analysis with zero-acceptance diagnostics
+    let fits = score_model_role_fit(&all_metrics);
+    eprintln!("{}", format_fit_report(&fits));
+
     // ── Summary ───────────────────────────────────────────────────────
     let summary = ContextPayload {
         run_id: config.run_id.clone(),
@@ -573,6 +578,7 @@ fn run_brainstorm_stage(
     stage1_dir: &Path,
     framing: &str,
     personas: &mut Vec<trace::PersonaAssignment>,
+    run_metrics: &mut Vec<PhaseMetrics>,
 ) -> String {
     // Gemini seeds the plan
     eprintln!("  → Gemini: solution-scout (seed plan)");
@@ -630,6 +636,27 @@ fn run_brainstorm_stage(
         "codex-contribute",
     );
     personas.push(persona_assignment(Model::Codex, "feasibility-scout", "brainstorming"));
+
+    // Record brainstorm contributor metrics
+    let ts = iso_now();
+    run_metrics.push(collect_output_metrics(
+        &config.run_id, &ts, Model::Gemini,
+        "solution-scout", "brainstorming",
+        seed_plan.len() as u32,
+        seed_plan.len() > 20 && seed_plan.contains("##"),
+    ));
+    run_metrics.push(collect_output_metrics(
+        &config.run_id, &ts, Model::Claude,
+        "elegance-scout", "brainstorming",
+        claude_contributions.len() as u32,
+        claude_contributions.len() > 20,
+    ));
+    run_metrics.push(collect_output_metrics(
+        &config.run_id, &ts, Model::Codex,
+        "feasibility-scout", "brainstorming",
+        codex_contributions.len() as u32,
+        codex_contributions.len() > 20,
+    ));
 
     // Synthesize
     eprintln!("  → Gemini: synthesizing contributions");
@@ -732,7 +759,9 @@ fn write_artifact(dir: &Path, name: &str, content: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::write(&path, content).ok();
+    if let Err(e) = fs::write(&path, content) {
+        eprintln!("[write_artifact] failed to write {}: {}", path.display(), e);
+    }
 }
 
 fn slugify(text: &str) -> String {

@@ -61,6 +61,37 @@
 /// - Acceptance rate: ~0% -> ~50%+ (acceptance-bias fix)
 /// - Convergence rate: ~0% -> ~70% within 2 rounds (severity budget + acceptance bias)
 /// - Synthesis size: 12-15KB -> 8-10KB (conciseness instruction)
+///
+/// # Third-pass tuning (2026-04-04)
+///
+/// Telemetry review of pass-2 runs showed acceptance-bias tuning only partially
+/// effective — zero-acceptance persists in some runs where ALL candidates get
+/// rejected in deliberation. Pattern analysis:
+///
+/// 1. **Zero-acceptance persists**: The deliberation lead treats all critiques
+///    as challenges to defend against, regardless of severity. Low-severity items
+///    (which are minor polish by definition) were being rejected at the same rate
+///    as high-severity items. Root cause: no severity-to-disposition mapping.
+///    Fix: Added explicit severity-proportional disposition rules — low → almost
+///    always ACCEPT, medium → lean ACCEPT/PARTIAL, high → evaluate carefully.
+///    Added zero-acceptance safeguard: if about to reject ALL, must re-read and
+///    find at least one genuine improvement.
+///
+/// 2. **Medium-severity inflation**: Reviewers submitted 3-5 medium items per
+///    review, creating a wall of "significant" critiques that overwhelms the lead.
+///    Fix: Added medium-severity budget (at most 2 per review) to CRITIQUE_PROMPT,
+///    with explicit guidance that LOW is the default severity.
+///
+/// 3. **Severity-disposition disconnect**: Pass-2 told the lead to "default to
+///    ACCEPT" but didn't tie this to critique severity. The lead applied uniform
+///    skepticism across all severity levels.
+///    Fix: Replaced generic acceptance-bias with severity-proportional rules.
+///    Lowered the self-check threshold from >50% rejections to >33%.
+///
+/// Expected improvements (pass 3):
+/// - Zero-acceptance runs: ~30% of runs -> <5% (severity-proportional disposition)
+/// - Acceptance rate: ~50% -> ~70%+ (low-severity auto-accept + medium budget)
+/// - Convergence rate: ~70% -> ~85% within 2 rounds (fewer inflated mediums)
 
 pub const FRAMING_PROMPT: &str = r#"You are the framing controller for an AI planning council.
 
@@ -169,13 +200,20 @@ Severity calibration (IMPORTANT — follow strictly):
   multiple candidates, pick the single most critical one and downgrade the rest.
 - **medium**: Significant gap that degrades quality but doesn't block shipping.
   Missing error handling, unclear ownership, incomplete edge case coverage.
+  BUDGET: At most 2 medium items per review. If you have more, keep the top 2
+  and downgrade the rest to low.
 - **low**: Polish items, minor improvements, style preferences, nice-to-haves.
+  This is your DEFAULT severity. Most critique points belong here.
   If in doubt between medium and low, ALWAYS choose LOW.
   If in doubt between high and medium, ALWAYS choose MEDIUM.
 
-A plan that achieves its stated goals with only minor gaps should receive ONLY
-low-severity items. Returning all-low or an empty critiques array is a sign of
-a good plan, not a failure of review. Do NOT inflate severity to appear thorough.
+Quality-proportional review:
+- A plan that achieves its stated goals with only minor gaps should receive ONLY
+  low-severity items. Returning all-low or an empty critiques array is a GOOD
+  outcome — it means the plan is solid, not that you failed to review.
+- Do NOT inflate severity to appear thorough. Your job is accuracy, not volume.
+- If you cannot find a genuine high or medium issue, submit only low items.
+  An honest all-low review is far more valuable than an inflated one.
 
 Current plan:
 {plan}
@@ -206,15 +244,26 @@ Your job:
 - Produce a revised plan incorporating accepted/partial changes
 - Keep decisions concise to avoid truncation
 
-Acceptance bias (IMPORTANT — follow strictly):
-- Default to ACCEPT when a critique identifies a real gap, even if the fix is small.
-- Use PARTIAL when the critique is directionally correct but the suggested fix is
-  too broad or impractical — accept the spirit, scope down the change.
-- REJECT ONLY when the critique misunderstands the plan, the issue doesn't exist,
-  or the proposed fix would make the design worse. Every REJECT must include a
-  specific explanation of why the critique is wrong, not just a dismissal.
-- If you find yourself rejecting more than half the critiques, pause and reconsider.
-  A high rejection rate usually means you are being too defensive about the plan.
+Severity-proportional disposition (IMPORTANT — follow strictly):
+- **Low-severity critiques → almost always ACCEPT.** These are minor improvements
+  by definition. Accept them unless the suggested change is actively harmful.
+  Rejecting a low-severity critique requires strong justification.
+- **Medium-severity critiques → lean ACCEPT or PARTIAL.** Default to ACCEPT when
+  the critique identifies a real gap. Use PARTIAL when directionally correct but
+  the suggested fix is too broad — accept the spirit, scope down the change.
+- **High-severity critiques → evaluate carefully.** These claim the plan would fail.
+  If the claim is valid, ACCEPT. If overstated, PARTIAL with a scoped fix.
+  REJECT only if the issue genuinely doesn't exist.
+- REJECT is reserved for critiques that misunderstand the plan, identify a
+  non-existent problem, or propose a fix that makes the design worse.
+  Every REJECT must include a specific explanation — not just a dismissal.
+
+Zero-acceptance safeguard:
+- If you are about to REJECT every critique, STOP. Re-read each one and find at
+  least one genuine improvement to ACCEPT. A 100% rejection rate almost always
+  means you are being too defensive, not that every critique is wrong.
+- If you find yourself rejecting more than a third of critiques, pause and
+  reconsider whether you are defending the plan rather than improving it.
 
 Current plan:
 {plan}
@@ -431,6 +480,7 @@ mod tests {
     #[test]
     fn critique_prompt_contains_high_severity_budget() {
         assert!(CRITIQUE_PROMPT.contains("AT MOST 1 item as high severity"));
+        assert!(CRITIQUE_PROMPT.contains("At most 2 medium items"));
         assert!(CRITIQUE_PROMPT.contains("ALWAYS choose LOW"));
         assert!(CRITIQUE_PROMPT.contains("ALWAYS choose MEDIUM"));
     }
@@ -439,9 +489,10 @@ mod tests {
 
     #[test]
     fn deliberation_prompt_contains_acceptance_bias() {
-        assert!(DELIBERATION_LEAD_PROMPT.contains("Acceptance bias"));
-        assert!(DELIBERATION_LEAD_PROMPT.contains("Default to ACCEPT"));
-        assert!(DELIBERATION_LEAD_PROMPT.contains("REJECT ONLY when"));
+        assert!(DELIBERATION_LEAD_PROMPT.contains("Severity-proportional disposition"));
+        assert!(DELIBERATION_LEAD_PROMPT.contains("almost always ACCEPT"));
+        assert!(DELIBERATION_LEAD_PROMPT.contains("Zero-acceptance safeguard"));
+        assert!(DELIBERATION_LEAD_PROMPT.contains("REJECT is reserved for"));
     }
 
     #[test]

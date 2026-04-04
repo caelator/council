@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Model {
     Gemini,
@@ -50,10 +52,19 @@ pub fn run_model(model: Model, prompt: &str, workdir: &Path) -> io::Result<Model
     })
 }
 
+static AVAILABILITY_CACHE: std::sync::LazyLock<Mutex<HashMap<Model, bool>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub fn check_available(model: Model) -> bool {
-    Command::new("which")
-        .arg(model.name())
+    let mut cache = AVAILABILITY_CACHE.lock().unwrap();
+    if let Some(&cached) = cache.get(&model) {
+        return cached;
+    }
+    let available = Command::new("sh")
+        .args(["-c", &format!("command -v {}", model.name())])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    cache.insert(model, available);
+    available
 }

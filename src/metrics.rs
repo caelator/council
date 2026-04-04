@@ -144,7 +144,7 @@ pub fn aggregate_profiles(metrics: &[PhaseMetrics]) -> Vec<ModelProfile> {
             });
         }
 
-        role_scores.sort_by(|a, b| b.composite.partial_cmp(&a.composite).unwrap());
+        role_scores.sort_by(|a, b| b.composite.partial_cmp(&a.composite).unwrap_or(std::cmp::Ordering::Equal));
 
         profiles.push(ModelProfile {
             model: model.clone(),
@@ -231,7 +231,7 @@ pub fn recommend_roles(
         }
     }
 
-    recommendations.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+    recommendations.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
     recommendations
 }
 
@@ -414,20 +414,194 @@ pub fn format_recommendations(recs: &[RoleRecommendation]) -> String {
     out
 }
 
+// ── Model-role fit scoring ───────────────────────────────────────────
+
+/// A single model-role fit score entry, used for telemetry-driven analysis.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelRoleFit {
+    pub model: String,
+    pub role: String,
+    pub phase: String,
+    pub observations: u32,
+    pub composite: f64,
+    /// How many runs had 0% acceptance rate (all critiques rejected).
+    pub zero_acceptance_runs: u32,
+    /// Fraction of runs with zero acceptance.
+    pub zero_acceptance_rate: f64,
+    pub avg_acceptance: f64,
+    pub avg_severity_accuracy: f64,
+    pub parse_reliability: f64,
+    /// Qualitative grade: "excellent", "good", "fair", "poor".
+    pub grade: String,
+}
+
+/// Diagnose model-role fit from historical metrics, including zero-acceptance detection.
+/// Returns fit scores sorted by composite (best first) for each (model, role) pair.
+pub fn score_model_role_fit(metrics: &[PhaseMetrics]) -> Vec<ModelRoleFit> {
+    let mut by_key: HashMap<(String, String, String), Vec<&PhaseMetrics>> = HashMap::new();
+    for m in metrics {
+        by_key
+            .entry((m.model.clone(), m.role.clone(), m.phase.clone()))
+            .or_default()
+            .push(m);
+    }
+
+    let mut fits = Vec::new();
+    for ((model, role, phase), entries) in &by_key {
+        let n = entries.len() as u32;
+
+        let acceptance_rates: Vec<f64> = entries
+            .iter()
+            .filter_map(|e| e.acceptance_rate())
+            .collect();
+        let avg_acceptance = if acceptance_rates.is_empty() {
+            0.5
+        } else {
+            acceptance_rates.iter().sum::<f64>() / acceptance_rates.len() as f64
+        };
+
+        let zero_acceptance_runs = acceptance_rates
+            .iter()
+            .filter(|&&r| r == 0.0)
+            .count() as u32;
+        let zero_acceptance_rate = if acceptance_rates.is_empty() {
+            0.0
+        } else {
+            zero_acceptance_runs as f64 / acceptance_rates.len() as f64
+        };
+
+        let severity_accs: Vec<f64> = entries
+            .iter()
+            .filter_map(|e| e.severity_accuracy())
+            .collect();
+        let avg_severity_acc = if severity_accs.is_empty() {
+            0.5
+        } else {
+            severity_accs.iter().sum::<f64>() / severity_accs.len() as f64
+        };
+
+        let parse_success_count = entries.iter().filter(|e| e.parse_success).count();
+        let parse_reliability = parse_success_count as f64 / n as f64;
+
+        let is_critic = role.contains("adversar") || role.contains("critic");
+        let composite = if is_critic {
+            avg_acceptance * 0.4 + avg_severity_acc * 0.4 + parse_reliability * 0.2
+        } else {
+            avg_acceptance * 0.2 + parse_reliability * 0.8
+        };
+
+        let grade = if composite >= 0.85 {
+            "excellent"
+        } else if composite >= 0.65 {
+            "good"
+        } else if composite >= 0.45 {
+            "fair"
+        } else {
+            "poor"
+        };
+
+        fits.push(ModelRoleFit {
+            model: model.clone(),
+            role: role.clone(),
+            phase: phase.clone(),
+            observations: n,
+            composite: round2(composite),
+            zero_acceptance_runs,
+            zero_acceptance_rate: round2(zero_acceptance_rate),
+            avg_acceptance: round2(avg_acceptance),
+            avg_severity_accuracy: round2(avg_severity_acc),
+            parse_reliability: round2(parse_reliability),
+            grade: grade.into(),
+        });
+    }
+
+    fits.sort_by(|a, b| {
+        b.composite
+            .partial_cmp(&a.composite)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    fits
+}
+
+/// Format a human-readable model-role fit report with zero-acceptance diagnostics.
+pub fn format_fit_report(fits: &[ModelRoleFit]) -> String {
+    let mut out = String::new();
+    out.push_str("Model-Role Fit Analysis\n");
+    out.push_str("══════════════════════════════════════════════════════════════\n\n");
+
+    for fit in fits {
+        out.push_str(&format!(
+            "  {} / {} ({})\n",
+            fit.model, fit.role, fit.phase
+        ));
+        out.push_str(&format!(
+            "    Observations: {}  Grade: {}  Composite: {:.0}%\n",
+            fit.observations,
+            fit.grade,
+            fit.composite * 100.0
+        ));
+        out.push_str(&format!(
+            "    Acceptance: {:.0}%  Severity Acc: {:.0}%  Parse: {:.0}%\n",
+            fit.avg_acceptance * 100.0,
+            fit.avg_severity_accuracy * 100.0,
+            fit.parse_reliability * 100.0,
+        ));
+        if fit.zero_acceptance_runs > 0 {
+            out.push_str(&format!(
+                "    ⚠ Zero-acceptance runs: {} ({:.0}% of observations)\n",
+                fit.zero_acceptance_runs,
+                fit.zero_acceptance_rate * 100.0,
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Summary: flag any models with high zero-acceptance rates
+    let problem_fits: Vec<&ModelRoleFit> = fits
+        .iter()
+        .filter(|f| f.zero_acceptance_rate > 0.2 && f.observations >= 2)
+        .collect();
+    if !problem_fits.is_empty() {
+        out.push_str("Flagged: high zero-acceptance rate (>20% of runs)\n");
+        for f in &problem_fits {
+            out.push_str(&format!(
+                "  → {} as {} in {}: {:.0}% zero-acceptance\n",
+                f.model,
+                f.role,
+                f.phase,
+                f.zero_acceptance_rate * 100.0,
+            ));
+        }
+    }
+
+    out
+}
+
 // ── Utilities ────────────────────────────────────────────────────────
+
+/// Normalize a string for fuzzy matching: lowercase, strip punctuation.
+fn normalize_for_match(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Fuzzy match: true if significant words from `needle` appear in `haystack`.
 fn fuzzy_match(needle: &str, haystack: &str) -> bool {
-    let needle_lower = needle.to_lowercase();
-    let haystack_lower = haystack.to_lowercase();
+    let needle_norm = normalize_for_match(needle);
+    let haystack_norm = normalize_for_match(haystack);
 
     // Direct substring
-    if haystack_lower.contains(&needle_lower) || needle_lower.contains(&haystack_lower) {
+    if haystack_norm.contains(&needle_norm) || needle_norm.contains(&haystack_norm) {
         return true;
     }
 
-    // Word overlap: if >= 50% of significant words match
-    let needle_words: Vec<&str> = needle_lower
+    // Word overlap: if >= 35% of significant words match
+    let needle_words: Vec<&str> = needle_norm
         .split_whitespace()
         .filter(|w| w.len() > 3) // skip short words
         .collect();
@@ -436,12 +610,32 @@ fn fuzzy_match(needle: &str, haystack: &str) -> bool {
         return false;
     }
 
-    let matches = needle_words
+    let word_matches = needle_words
         .iter()
-        .filter(|w| haystack_lower.contains(**w))
+        .filter(|w| haystack_norm.contains(**w))
         .count();
 
-    matches as f64 / needle_words.len() as f64 >= 0.5
+    if word_matches as f64 / needle_words.len() as f64 >= 0.35 {
+        return true;
+    }
+
+    // Bigram matching: if any 2-word sequence from needle appears in haystack
+    if needle_words.len() >= 2 {
+        let haystack_words: Vec<&str> = haystack_norm.split_whitespace().collect();
+        let haystack_bigrams: Vec<String> = haystack_words
+            .windows(2)
+            .map(|w| format!("{} {}", w[0], w[1]))
+            .collect();
+
+        for pair in needle_words.windows(2) {
+            let bigram = format!("{} {}", pair[0], pair[1]);
+            if haystack_bigrams.contains(&bigram) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn round2(v: f64) -> f64 {
@@ -610,5 +804,72 @@ mod tests {
         assert!(card.contains("claude"));
         assert!(card.contains("adversary"));
         assert!(card.contains("85%"));
+    }
+
+    // -- Model-role fit scoring tests --
+
+    #[test]
+    fn score_model_role_fit_detects_zero_acceptance() {
+        let metrics = vec![
+            // Run 1: all rejected (0 accepted, 5 rejected)
+            make_phase_metrics("codex", "synthesis-owner", "deliberation", 5, 0, 5, 0, 0, true),
+            // Run 2: all rejected again
+            make_phase_metrics("codex", "synthesis-owner", "deliberation", 4, 0, 4, 0, 0, true),
+            // Run 3: some accepted
+            make_phase_metrics("codex", "synthesis-owner", "deliberation", 6, 4, 2, 0, 0, true),
+        ];
+        let fits = score_model_role_fit(&metrics);
+        assert_eq!(fits.len(), 1);
+        let fit = &fits[0];
+        assert_eq!(fit.model, "codex");
+        assert_eq!(fit.zero_acceptance_runs, 2);
+        assert!((fit.zero_acceptance_rate - 0.67).abs() < 0.01);
+    }
+
+    #[test]
+    fn score_model_role_fit_grades_correctly() {
+        let metrics = vec![
+            // Excellent: high acceptance, good severity accuracy, good parse
+            make_phase_metrics("claude", "adversarial-reviewer", "deliberation", 10, 9, 1, 2, 2, true),
+            // Poor: low acceptance, bad severity accuracy, bad parse
+            make_phase_metrics("gemini", "adversarial-reviewer", "deliberation", 10, 2, 8, 4, 0, false),
+        ];
+        let fits = score_model_role_fit(&metrics);
+        let claude_fit = fits.iter().find(|f| f.model == "claude").unwrap();
+        let gemini_fit = fits.iter().find(|f| f.model == "gemini").unwrap();
+        assert_eq!(claude_fit.grade, "excellent");
+        assert!(gemini_fit.grade == "poor" || gemini_fit.grade == "fair");
+    }
+
+    #[test]
+    fn score_model_role_fit_no_zero_acceptance_when_all_accepted() {
+        let metrics = vec![
+            make_phase_metrics("claude", "adversarial-reviewer", "deliberation", 5, 5, 0, 1, 1, true),
+            make_phase_metrics("claude", "adversarial-reviewer", "deliberation", 3, 3, 0, 0, 0, true),
+        ];
+        let fits = score_model_role_fit(&metrics);
+        assert_eq!(fits[0].zero_acceptance_runs, 0);
+        assert!((fits[0].zero_acceptance_rate - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn format_fit_report_includes_warning_for_zero_acceptance() {
+        let fits = vec![ModelRoleFit {
+            model: "codex".into(),
+            role: "synthesis-owner".into(),
+            phase: "deliberation".into(),
+            observations: 4,
+            composite: 0.30,
+            zero_acceptance_runs: 3,
+            zero_acceptance_rate: 0.75,
+            avg_acceptance: 0.10,
+            avg_severity_accuracy: 0.50,
+            parse_reliability: 1.0,
+            grade: "poor".into(),
+        }];
+        let report = format_fit_report(&fits);
+        assert!(report.contains("Zero-acceptance runs: 3"));
+        assert!(report.contains("zero-acceptance"));
+        assert!(report.contains("codex"));
     }
 }
