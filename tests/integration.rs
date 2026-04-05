@@ -269,7 +269,11 @@ fi
 #[test]
 fn e2e_full_pipeline_with_mock_models() {
     let council_bin = build_council();
-    assert!(council_bin.exists(), "council binary not found at {:?}", council_bin);
+    assert!(
+        council_bin.exists(),
+        "council binary not found at {:?}",
+        council_bin
+    );
 
     // Create temp directories
     let tmp = env::temp_dir().join(format!("council-e2e-{}", std::process::id()));
@@ -290,10 +294,7 @@ fn e2e_full_pipeline_with_mock_models() {
     let new_path = format!("{}:{}", mock_dir.display(), original_path);
 
     let output = Command::new(&council_bin)
-        .args([
-            workdir.to_str().unwrap(),
-            "Design a key-value store",
-        ])
+        .args([workdir.to_str().unwrap(), "Design a key-value store"])
         .env("PATH", &new_path)
         .env("COUNCIL_DIR", council_dir.to_str().unwrap())
         .env("COUNCIL_ROUNDS", "2")
@@ -308,27 +309,51 @@ fn e2e_full_pipeline_with_mock_models() {
     eprintln!("--- council stderr ---\n{}", stderr);
 
     // Assert: all 4 stages completed (check stderr for stage markers)
-    assert!(stderr.contains("Stage 0: Framing"), "Stage 0 not found in stderr");
-    assert!(stderr.contains("Stage 1: Brainstorming"), "Stage 1 not found in stderr");
-    assert!(stderr.contains("Stage 2: Adversarial Deliberation"), "Stage 2 not found in stderr");
-    assert!(stderr.contains("Stage 3: Build Handoff"), "Stage 3 not found in stderr");
-    assert!(stderr.contains("Council Complete"), "Council Complete not found in stderr");
+    assert!(
+        stderr.contains("Stage 0: Framing"),
+        "Stage 0 not found in stderr"
+    );
+    assert!(
+        stderr.contains("Stage 1: Brainstorming"),
+        "Stage 1 not found in stderr"
+    );
+    assert!(
+        stderr.contains("Stage 2: Adversarial Deliberation"),
+        "Stage 2 not found in stderr"
+    );
+    assert!(
+        stderr.contains("Stage 3: Build Handoff"),
+        "Stage 3 not found in stderr"
+    );
+    assert!(
+        stderr.contains("Council Complete"),
+        "Council Complete not found in stderr"
+    );
 
     // Assert: final-plan.md exists and is non-empty
     let final_plan_path = council_dir.join("final-plan.md");
     assert!(final_plan_path.exists(), "final-plan.md not found");
     let final_plan = fs::read_to_string(&final_plan_path).unwrap();
     assert!(!final_plan.trim().is_empty(), "final-plan.md is empty");
-    assert!(final_plan.contains("Key-Value"), "final-plan.md doesn't contain expected content");
+    assert!(
+        final_plan.contains("Key-Value"),
+        "final-plan.md doesn't contain expected content"
+    );
 
     // Assert: run-summary.json exists and parses with schema_version
     let summary_path = council_dir.join("run-summary.json");
     assert!(summary_path.exists(), "run-summary.json not found");
     let summary_text = fs::read_to_string(&summary_path).unwrap();
-    let summary: serde_json::Value = serde_json::from_str(&summary_text)
-        .expect("run-summary.json is not valid JSON");
-    assert!(summary.get("run_id").is_some(), "run-summary.json missing run_id");
-    assert!(summary.get("converged").is_some(), "run-summary.json missing converged");
+    let summary: serde_json::Value =
+        serde_json::from_str(&summary_text).expect("run-summary.json is not valid JSON");
+    assert!(
+        summary.get("run_id").is_some(),
+        "run-summary.json missing run_id"
+    );
+    assert!(
+        summary.get("converged").is_some(),
+        "run-summary.json missing converged"
+    );
     assert!(
         summary.get("schema_version").is_some(),
         "run-summary.json missing schema_version"
@@ -341,7 +366,10 @@ fn e2e_full_pipeline_with_mock_models() {
 
     // Assert: convergence was detected (all-low critiques)
     let converged = summary["converged"].as_bool().unwrap_or(false);
-    assert!(converged, "pipeline did not converge (expected all-low critiques)");
+    assert!(
+        converged,
+        "pipeline did not converge (expected all-low critiques)"
+    );
 
     // Assert: telemetry JSONL files were written
     let traces_path = memoryport.join("council-traces.jsonl");
@@ -371,12 +399,12 @@ fn e2e_full_pipeline_with_mock_models() {
 
     // Verify telemetry is valid JSON lines
     for line in traces.lines() {
-        let _: serde_json::Value = serde_json::from_str(line)
-            .expect("traces JSONL line is not valid JSON");
+        let _: serde_json::Value =
+            serde_json::from_str(line).expect("traces JSONL line is not valid JSON");
     }
     for line in plans.lines() {
-        let _: serde_json::Value = serde_json::from_str(line)
-            .expect("plans JSONL line is not valid JSON");
+        let _: serde_json::Value =
+            serde_json::from_str(line).expect("plans JSONL line is not valid JSON");
     }
 
     // Assert: decision-log.json in round dirs has schema_version
@@ -385,8 +413,8 @@ fn e2e_full_pipeline_with_mock_models() {
         let dlog_path = round_dir.join("decision-log.json");
         if dlog_path.exists() {
             let dlog_text = fs::read_to_string(&dlog_path).unwrap();
-            let dlog: serde_json::Value = serde_json::from_str(&dlog_text)
-                .expect("decision-log.json is not valid JSON");
+            let dlog: serde_json::Value =
+                serde_json::from_str(&dlog_text).expect("decision-log.json is not valid JSON");
             assert!(
                 dlog.get("schema_version").is_some(),
                 "decision-log.json round {round} missing schema_version"
@@ -447,7 +475,10 @@ fn e2e_resume_reads_v1_payload_without_schema_version() {
     eprintln!("--- resume stderr ---\n{}", stderr);
 
     // Should complete successfully
-    assert!(stderr.contains("Council Complete"), "Council did not complete on resume");
+    assert!(
+        stderr.contains("Council Complete"),
+        "Council did not complete on resume"
+    );
 
     // Should have logged that it loaded the v1 summary
     assert!(

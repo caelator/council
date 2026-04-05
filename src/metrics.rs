@@ -144,7 +144,11 @@ pub fn aggregate_profiles(metrics: &[PhaseMetrics]) -> Vec<ModelProfile> {
             });
         }
 
-        role_scores.sort_by(|a, b| b.composite.partial_cmp(&a.composite).unwrap_or(std::cmp::Ordering::Equal));
+        role_scores.sort_by(|a, b| {
+            b.composite
+                .partial_cmp(&a.composite)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         profiles.push(ModelProfile {
             model: model.clone(),
@@ -231,7 +235,11 @@ pub fn recommend_roles(
         }
     }
 
-    recommendations.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    recommendations.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     recommendations
 }
 
@@ -277,9 +285,10 @@ pub fn collect_critique_metrics(
     let mut high_accepted = 0u32;
 
     for cp in &critique.critiques {
-        if let Some((_, disposition, _)) = decisions.iter().find(|(issue, _, _)| {
-            fuzzy_match(&cp.issue, issue)
-        }) {
+        if let Some((_, disposition, _)) = decisions
+            .iter()
+            .find(|(issue, _, _)| fuzzy_match(&cp.issue, issue))
+        {
             match disposition {
                 Disposition::Accept => {
                     accepted += 1;
@@ -450,20 +459,15 @@ pub fn score_model_role_fit(metrics: &[PhaseMetrics]) -> Vec<ModelRoleFit> {
     for ((model, role, phase), entries) in &by_key {
         let n = entries.len() as u32;
 
-        let acceptance_rates: Vec<f64> = entries
-            .iter()
-            .filter_map(|e| e.acceptance_rate())
-            .collect();
+        let acceptance_rates: Vec<f64> =
+            entries.iter().filter_map(|e| e.acceptance_rate()).collect();
         let avg_acceptance = if acceptance_rates.is_empty() {
             0.5
         } else {
             acceptance_rates.iter().sum::<f64>() / acceptance_rates.len() as f64
         };
 
-        let zero_acceptance_runs = acceptance_rates
-            .iter()
-            .filter(|&&r| r == 0.0)
-            .count() as u32;
+        let zero_acceptance_runs = acceptance_rates.iter().filter(|&&r| r == 0.0).count() as u32;
         let zero_acceptance_rate = if acceptance_rates.is_empty() {
             0.0
         } else {
@@ -530,10 +534,7 @@ pub fn format_fit_report(fits: &[ModelRoleFit]) -> String {
     out.push_str("══════════════════════════════════════════════════════════════\n\n");
 
     for fit in fits {
-        out.push_str(&format!(
-            "  {} / {} ({})\n",
-            fit.model, fit.role, fit.phase
-        ));
+        out.push_str(&format!("  {} / {} ({})\n", fit.model, fit.role, fit.phase));
         out.push_str(&format!(
             "    Observations: {}  Grade: {}  Composite: {:.0}%\n",
             fit.observations,
@@ -583,7 +584,13 @@ pub fn format_fit_report(fits: &[ModelRoleFit]) -> String {
 fn normalize_for_match(s: &str) -> String {
     s.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -782,7 +789,10 @@ mod tests {
 
     #[test]
     fn fuzzy_match_no_match() {
-        assert!(!fuzzy_match("completely different", "nothing in common here"));
+        assert!(!fuzzy_match(
+            "completely different",
+            "nothing in common here"
+        ));
     }
 
     #[test]
@@ -812,11 +822,41 @@ mod tests {
     fn score_model_role_fit_detects_zero_acceptance() {
         let metrics = vec![
             // Run 1: all rejected (0 accepted, 5 rejected)
-            make_phase_metrics("codex", "synthesis-owner", "deliberation", 5, 0, 5, 0, 0, true),
+            make_phase_metrics(
+                "codex",
+                "synthesis-owner",
+                "deliberation",
+                5,
+                0,
+                5,
+                0,
+                0,
+                true,
+            ),
             // Run 2: all rejected again
-            make_phase_metrics("codex", "synthesis-owner", "deliberation", 4, 0, 4, 0, 0, true),
+            make_phase_metrics(
+                "codex",
+                "synthesis-owner",
+                "deliberation",
+                4,
+                0,
+                4,
+                0,
+                0,
+                true,
+            ),
             // Run 3: some accepted
-            make_phase_metrics("codex", "synthesis-owner", "deliberation", 6, 4, 2, 0, 0, true),
+            make_phase_metrics(
+                "codex",
+                "synthesis-owner",
+                "deliberation",
+                6,
+                4,
+                2,
+                0,
+                0,
+                true,
+            ),
         ];
         let fits = score_model_role_fit(&metrics);
         assert_eq!(fits.len(), 1);
@@ -830,9 +870,29 @@ mod tests {
     fn score_model_role_fit_grades_correctly() {
         let metrics = vec![
             // Excellent: high acceptance, good severity accuracy, good parse
-            make_phase_metrics("claude", "adversarial-reviewer", "deliberation", 10, 9, 1, 2, 2, true),
+            make_phase_metrics(
+                "claude",
+                "adversarial-reviewer",
+                "deliberation",
+                10,
+                9,
+                1,
+                2,
+                2,
+                true,
+            ),
             // Poor: low acceptance, bad severity accuracy, bad parse
-            make_phase_metrics("gemini", "adversarial-reviewer", "deliberation", 10, 2, 8, 4, 0, false),
+            make_phase_metrics(
+                "gemini",
+                "adversarial-reviewer",
+                "deliberation",
+                10,
+                2,
+                8,
+                4,
+                0,
+                false,
+            ),
         ];
         let fits = score_model_role_fit(&metrics);
         let claude_fit = fits.iter().find(|f| f.model == "claude").unwrap();
@@ -844,8 +904,28 @@ mod tests {
     #[test]
     fn score_model_role_fit_no_zero_acceptance_when_all_accepted() {
         let metrics = vec![
-            make_phase_metrics("claude", "adversarial-reviewer", "deliberation", 5, 5, 0, 1, 1, true),
-            make_phase_metrics("claude", "adversarial-reviewer", "deliberation", 3, 3, 0, 0, 0, true),
+            make_phase_metrics(
+                "claude",
+                "adversarial-reviewer",
+                "deliberation",
+                5,
+                5,
+                0,
+                1,
+                1,
+                true,
+            ),
+            make_phase_metrics(
+                "claude",
+                "adversarial-reviewer",
+                "deliberation",
+                3,
+                3,
+                0,
+                0,
+                0,
+                true,
+            ),
         ];
         let fits = score_model_role_fit(&metrics);
         assert_eq!(fits[0].zero_acceptance_runs, 0);

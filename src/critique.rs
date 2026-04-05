@@ -102,7 +102,9 @@ pub fn read_context_payload(path: &std::path::Path) -> Result<ContextPayload, St
                     if ver > CURRENT_SCHEMA_VERSION as u64 {
                         eprintln!(
                             "  [warn] read_context_payload: schema_version {} in {} is newer than supported ({}), attempting best-effort parse",
-                            ver, path.display(), CURRENT_SCHEMA_VERSION
+                            ver,
+                            path.display(),
+                            CURRENT_SCHEMA_VERSION
                         );
                     }
                 }
@@ -204,7 +206,9 @@ pub fn is_converged(critique: &StructuredCritique) -> bool {
 
     // Defense-in-depth: detect fallback wrapper and try to recover severities
     if critique.critiques.len() == 1
-        && critique.critiques[0].issue.starts_with("Unstructured critique")
+        && critique.critiques[0]
+            .issue
+            .starts_with("Unstructured critique")
     {
         let raw = &critique.critiques[0].suggested_delta;
         // Try all extraction strategies on the raw text embedded in the fallback
@@ -271,9 +275,15 @@ pub fn parse_decision_log(revision_text: &str) -> Vec<DecisionEntry> {
 
         // Split on " -- " or " - " for issue/rationale separation
         let (issue, rationale) = if let Some(idx) = rest.find(" -- ") {
-            (rest[..idx].trim().to_string(), rest[idx + 4..].trim().to_string())
+            (
+                rest[..idx].trim().to_string(),
+                rest[idx + 4..].trim().to_string(),
+            )
         } else if let Some(idx) = rest.find(" - ") {
-            (rest[..idx].trim().to_string(), rest[idx + 3..].trim().to_string())
+            (
+                rest[..idx].trim().to_string(),
+                rest[idx + 3..].trim().to_string(),
+            )
         } else {
             (rest.to_string(), String::new())
         };
@@ -301,7 +311,10 @@ pub fn parse_decision_log(revision_text: &str) -> Vec<DecisionEntry> {
 }
 
 /// Extract a `[model]` tag from the start of text, falling back to section source.
-fn extract_source_tag<'a>(text: &'a str, section_source: &Option<String>) -> (Option<String>, &'a str) {
+fn extract_source_tag<'a>(
+    text: &'a str,
+    section_source: &Option<String>,
+) -> (Option<String>, &'a str) {
     if text.starts_with('[') {
         if let Some(end) = text.find(']') {
             let tag = text[1..end].trim().to_lowercase();
@@ -315,9 +328,7 @@ fn extract_source_tag<'a>(text: &'a str, section_source: &Option<String>) -> (Op
 
 /// Case-insensitive prefix strip: returns the remainder if `text` starts with `prefix` (ignoring case).
 fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
-    if text.len() >= prefix.len()
-        && text[..prefix.len()].eq_ignore_ascii_case(prefix)
-    {
+    if text.len() >= prefix.len() && text[..prefix.len()].eq_ignore_ascii_case(prefix) {
         Some(&text[prefix.len()..])
     } else {
         None
@@ -375,7 +386,11 @@ mod tests {
     fn parse_critique_fallback_on_garbage() {
         let result = parse_critique("This is not JSON at all", "test-role");
         assert_eq!(result.critiques.len(), 1);
-        assert!(result.critiques[0].issue.starts_with("Unstructured critique"));
+        assert!(
+            result.critiques[0]
+                .issue
+                .starts_with("Unstructured critique")
+        );
     }
 
     #[test]

@@ -92,6 +92,25 @@
 /// - Zero-acceptance runs: ~30% of runs -> <5% (severity-proportional disposition)
 /// - Acceptance rate: ~50% -> ~70%+ (low-severity auto-accept + medium budget)
 /// - Convergence rate: ~70% -> ~85% within 2 rounds (fewer inflated mediums)
+///
+/// # Fourth-pass tuning (2026-04-04, telemetry-guided)
+///
+/// Code telemetry and prior tuning notes indicate the best pass-2 outputs share
+/// three traits:
+///
+/// 1. **Critique triage before defense**: higher-quality revisions handle low-cost,
+///    obviously valid critiques first, which breaks the defensive posture and raises
+///    acceptance rates.
+/// 2. **Scoped partial accepts**: the strongest synthesis outputs do not merely say
+///    PARTIAL — they translate critiques into a precise bounded change, preserving
+///    plan stability while still incorporating the signal.
+/// 3. **Delta-focused revisions**: reviewer quality improves when revised plans call
+///    out what changed and why, rather than reprinting large unchanged sections.
+///
+/// Pass-4 prompt changes:
+/// - Added explicit triage order: low → medium → high
+/// - Added a requirement that each ACCEPT/PARTIAL maps to a concrete plan edit
+/// - Added stronger guidance to preserve strengths and summarize only changed sections
 
 pub const FRAMING_PROMPT: &str = r#"You are the framing controller for an AI planning council.
 
@@ -243,6 +262,15 @@ Your job:
 - Classify each as ACCEPT / PARTIAL / REJECT with a one-sentence rationale
 - Produce a revised plan incorporating accepted/partial changes
 - Keep decisions concise to avoid truncation
+- Preserve strengths called out by reviewers unless a change requires otherwise
+
+Telemetry-guided working method:
+- Triage critiques in this order: LOW first, then MEDIUM, then HIGH. This prevents
+  defensive overreaction and usually surfaces easy wins early.
+- For every ACCEPT or PARTIAL, identify the exact plan section to modify and the
+  concrete delta you will apply before writing the revised plan.
+- For PARTIAL, accept the valid core of the critique and explicitly scope the fix
+  to the smallest change that resolves the real issue.
 
 Severity-proportional disposition (IMPORTANT — follow strictly):
 - **Low-severity critiques → almost always ACCEPT.** These are minor improvements
@@ -299,7 +327,9 @@ with [CHANGED] tags. Preserve all original sections that were not changed.
 
 Keep the revised plan CONCISE — do not expand unchanged sections. Only rewrite
 sections that were actually modified by accepted/partial critiques. Target the
-same length as the input plan or shorter."#;
+same length as the input plan or shorter.
+For each [CHANGED] section, make the delta obvious and directly traceable to one
+or more ACCEPT/PARTIAL decisions above."#;
 
 pub const HANDOFF_PROMPT: &str = r#"You are preparing the build handoff for an AI planning council.
 
@@ -384,17 +414,32 @@ mod tests {
             FRAMING_PROMPT,
             &[("task", "Build a CLI tool"), ("external_context", "none")],
         );
-        assert!(result.contains("## Problem Brief"), "Missing Problem Brief header");
-        assert!(result.contains("## Constraints"), "Missing Constraints header");
-        assert!(result.contains("## Success Criteria"), "Missing Success Criteria header");
-        assert!(result.contains("## Out of Scope"), "Missing Out of Scope header");
+        assert!(
+            result.contains("## Problem Brief"),
+            "Missing Problem Brief header"
+        );
+        assert!(
+            result.contains("## Constraints"),
+            "Missing Constraints header"
+        );
+        assert!(
+            result.contains("## Success Criteria"),
+            "Missing Success Criteria header"
+        );
+        assert!(
+            result.contains("## Out of Scope"),
+            "Missing Out of Scope header"
+        );
     }
 
     #[test]
     fn framing_prompt_substitutes_task_and_context() {
         let result = fmt_prompt(
             FRAMING_PROMPT,
-            &[("task", "Design a cache layer"), ("external_context", "Redis is available")],
+            &[
+                ("task", "Design a cache layer"),
+                ("external_context", "Redis is available"),
+            ],
         );
         assert!(result.contains("Design a cache layer"));
         assert!(result.contains("Redis is available"));
