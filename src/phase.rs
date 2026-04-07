@@ -111,6 +111,35 @@
 /// - Added explicit triage order: low → medium → high
 /// - Added a requirement that each ACCEPT/PARTIAL maps to a concrete plan edit
 /// - Added stronger guidance to preserve strengths and summarize only changed sections
+///
+/// # Fifth-pass tuning (2026-04-07, telemetry-guided)
+///
+/// Analysis of real telemetry (council-metrics.jsonl, 2 runs, 17 metric records):
+///
+/// 1. **Zero-acceptance is actually zero-matching**: In run council-1775267346,
+///    ALL critic entries show critiques_accepted=0 AND critiques_rejected=0. This
+///    means parse_decision_log returned empty — Codex's decision log format didn't
+///    match the expected "- ACCEPT: issue -- rationale" pattern. The problem is
+///    format compliance, not critique quality.
+///    Fix: Added a concrete copy-paste example to DELIBERATION_LEAD_PROMPT with
+///    exact formatting rules. Added critiques_unmatched field to PhaseMetrics to
+///    distinguish "all rejected" from "format mismatch".
+///
+/// 2. **Format fragility**: parse_decision_log only handled "- ACCEPT:" with
+///    dash bullets. Real model outputs use bold (**ACCEPT**:), numbered lists (1.),
+///    asterisk bullets (*), and em-dashes (—).
+///    Fix: Added normalize_decision_line() that strips all these variations before
+///    disposition matching.
+///
+/// 3. **Model-role fit scores not persisted**: RoleFitness computed scores but only
+///    printed them to stderr. No queryable artifact across runs.
+///    Fix: Added council-fit-scores.jsonl output with run_id, timestamp, and all
+///    fit dimensions per (model, role) pair.
+///
+/// Expected improvements (pass 5):
+/// - Zero-matching rate: ~50% of runs -> <10% (format normalization + example)
+/// - Fit score queryability: none -> full JSONL history
+/// - Diagnostic precision: "0 accepted" now distinguishable from "0 matched"
 
 pub const FRAMING_PROMPT: &str = r#"You are the framing controller for an AI planning council.
 
