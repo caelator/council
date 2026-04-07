@@ -28,6 +28,10 @@ pub struct PhaseMetrics {
     pub high_severity_submitted: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_severity_accepted: Option<u32>,
+    /// Critiques that could not be matched to any decision entry (fuzzy matching gap).
+    /// Non-zero values indicate decision log parsing or format issues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critiques_unmatched: Option<u32>,
 
     // Output quality
     pub output_bytes: u32,
@@ -284,6 +288,8 @@ pub fn collect_critique_metrics(
     let mut rejected = 0u32;
     let mut high_accepted = 0u32;
 
+    let mut unmatched = 0u32;
+
     for cp in &critique.critiques {
         if let Some((_, disposition, _)) = decisions
             .iter()
@@ -306,8 +312,27 @@ pub fn collect_critique_metrics(
                     rejected += 1;
                 }
             }
+        } else {
+            unmatched += 1;
         }
-        // Unmatched critiques are not counted as rejected — data gap, not failure
+    }
+
+    // Warn when all critiques are unmatched — signals decision log format mismatch
+    if unmatched > 0 && unmatched == submitted {
+        eprintln!(
+            "  [warn] {} as {}: all {} critiques unmatched (decision log format issue?)",
+            model.name(),
+            role,
+            submitted
+        );
+    } else if unmatched > 0 {
+        eprintln!(
+            "  [info] {} as {}: {} of {} critiques unmatched",
+            model.name(),
+            role,
+            unmatched,
+            submitted
+        );
     }
 
     PhaseMetrics {
@@ -322,6 +347,7 @@ pub fn collect_critique_metrics(
         critiques_rejected: Some(rejected),
         high_severity_submitted: Some(high_submitted),
         high_severity_accepted: Some(high_accepted),
+        critiques_unmatched: Some(unmatched),
         output_bytes,
         parse_success,
     }
@@ -349,6 +375,7 @@ pub fn collect_output_metrics(
         critiques_rejected: None,
         high_severity_submitted: None,
         high_severity_accepted: None,
+        critiques_unmatched: None,
         output_bytes,
         parse_success,
     }
@@ -684,6 +711,7 @@ mod tests {
             critiques_rejected: Some(rejected),
             high_severity_submitted: Some(high_sub),
             high_severity_accepted: Some(high_acc),
+            critiques_unmatched: Some(submitted.saturating_sub(accepted + rejected)),
             output_bytes: 1000,
             parse_success: parse_ok,
         }

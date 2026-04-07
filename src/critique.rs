@@ -234,6 +234,9 @@ pub fn is_converged(critique: &StructuredCritique) -> bool {
 /// Parse decision entries from the Codex deliberation/revision output.
 /// Looks for lines matching: `- ACCEPT|PARTIAL|REJECT: [model] <issue> -- <rationale>`
 /// The `[model]` tag is optional for backward compatibility.
+///
+/// Handles format variations: bold markers (**ACCEPT**:), numbered lists (1.),
+/// asterisk bullets (*), and various whitespace/punctuation around the disposition keyword.
 pub fn parse_decision_log(revision_text: &str) -> Vec<DecisionEntry> {
     let mut entries = Vec::new();
     // Track current section source: lines under "### Claude" or "### Gemini" headers
@@ -242,27 +245,38 @@ pub fn parse_decision_log(revision_text: &str) -> Vec<DecisionEntry> {
     for line in revision_text.lines() {
         // Detect section headers like "### Claude (conceptual-risk)" or "### Gemini"
         let trimmed_line = line.trim();
-        if trimmed_line.starts_with("###") {
-            let header = trimmed_line.trim_start_matches('#').trim().to_lowercase();
-            if header.starts_with("claude") {
+        if trimmed_line.starts_with("###") || trimmed_line.starts_with("**##") {
+            let header = trimmed_line
+                .trim_start_matches('#')
+                .trim_start_matches('*')
+                .trim()
+                .to_lowercase();
+            if header.starts_with("claude") || header.contains("(conceptual") {
                 section_source = Some("claude".into());
-            } else if header.starts_with("gemini") {
+            } else if header.starts_with("gemini") || header.contains("(implementation") {
                 section_source = Some("gemini".into());
             } else if header.starts_with("codex") {
                 section_source = Some("codex".into());
-            } else {
-                // Unknown section — don't reset, could be unrelated header
             }
             continue;
         }
 
-        let trimmed = trimmed_line.trim_start_matches('-').trim();
+        // Normalize the line: strip list markers, bold wrappers, etc.
+        let normalized = normalize_decision_line(trimmed_line);
+        let trimmed = normalized.as_str();
+
         // Match ACCEPT: / PARTIAL: / REJECT: at the start
         let (disposition, rest) = if let Some(rest) = strip_prefix_ci(trimmed, "ACCEPT:") {
             (Disposition::Accept, rest)
         } else if let Some(rest) = strip_prefix_ci(trimmed, "PARTIAL:") {
             (Disposition::Partial, rest)
         } else if let Some(rest) = strip_prefix_ci(trimmed, "REJECT:") {
+            (Disposition::Reject, rest)
+        } else if let Some(rest) = strip_prefix_ci(trimmed, "ACCEPT -") {
+            (Disposition::Accept, rest)
+        } else if let Some(rest) = strip_prefix_ci(trimmed, "PARTIAL -") {
+            (Disposition::Partial, rest)
+        } else if let Some(rest) = strip_prefix_ci(trimmed, "REJECT -") {
             (Disposition::Reject, rest)
         } else {
             continue;
@@ -273,20 +287,8 @@ pub fn parse_decision_log(revision_text: &str) -> Vec<DecisionEntry> {
         // Extract optional [model] tag at the start of the issue
         let (source_model, rest) = extract_source_tag(rest, &section_source);
 
-        // Split on " -- " or " - " for issue/rationale separation
-        let (issue, rationale) = if let Some(idx) = rest.find(" -- ") {
-            (
-                rest[..idx].trim().to_string(),
-                rest[idx + 4..].trim().to_string(),
-            )
-        } else if let Some(idx) = rest.find(" - ") {
-            (
-                rest[..idx].trim().to_string(),
-                rest[idx + 3..].trim().to_string(),
-            )
-        } else {
-            (rest.to_string(), String::new())
-        };
+        // Split on " -- " or " — " (em-dash) or " - " for issue/rationale separation
+        let (issue, rationale) = split_issue_rationale(rest);
 
         if issue.is_empty() {
             continue;
@@ -308,6 +310,72 @@ pub fn parse_decision_log(revision_text: &str) -> Vec<DecisionEntry> {
         });
     }
     entries
+}
+
+/// Normalize a decision log line by stripping list markers and bold wrappers.
+/// Produces an owned String so we can freely manipulate the text.
+///
+/// Examples:
+/// - `"- **ACCEPT**: issue"` -> `"ACCEPT: issue"`
+/// - `"1. ACCEPT: issue"` -> `"ACCEPT: issue"`
+/// - `"* **PARTIAL:** issue"` -> `"PARTIAL: issue"`
+fn normalize_decision_line(line: &str) -> String {
+    let mut s = line.trim().to_string();
+
+    // Strip leading list markers: "- ", "* ", "1. ", "1) "
+    if s.starts_with("- ") || s.starts_with("* ") {
+        s = s[2..].trim_start().to_string();
+    } else {
+        // Check for numbered list: "1. " or "1) "
+        let digit_end = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digit_end > 0 && digit_end < s.len() {
+            let next = s.as_bytes()[digit_end];
+            if (next == b'.' || next == b')') && s.len() > digit_end + 1 {
+                s = s[digit_end + 1..].trim_start().to_string();
+            }
+        }
+    }
+
+    // Strip bold wrappers: "**ACCEPT**:" -> "ACCEPT:", "**ACCEPT:**" -> "ACCEPT:"
+    if s.starts_with("**") {
+        if let Some(end) = s[2..].find("**") {
+            let inner = &s[2..2 + end];
+            let kw = inner.trim_end_matches(':');
+            if kw.eq_ignore_ascii_case("ACCEPT")
+                || kw.eq_ignore_ascii_case("PARTIAL")
+                || kw.eq_ignore_ascii_case("REJECT")
+            {
+                let after = s[2 + end + 2..].to_string();
+                if inner.ends_with(':') {
+                    // "**ACCEPT:**rest" -> "ACCEPT:rest"
+                    s = format!("{}{}", inner, after);
+                } else if after.starts_with(':') {
+                    // "**ACCEPT**:rest" -> "ACCEPT:rest"
+                    s = format!("{}{}", kw, after);
+                }
+            }
+        }
+    }
+
+    s
+}
+
+/// Split "issue -- rationale" or "issue — rationale" or "issue - rationale".
+fn split_issue_rationale(s: &str) -> (String, String) {
+    // Try " -- " first (most common/expected)
+    if let Some(idx) = s.find(" -- ") {
+        return (s[..idx].trim().to_string(), s[idx + 4..].trim().to_string());
+    }
+    // Try em-dash " — "
+    if let Some(idx) = s.find(" \u{2014} ") {
+        let em_len = " \u{2014} ".len();
+        return (s[..idx].trim().to_string(), s[idx + em_len..].trim().to_string());
+    }
+    // Try single dash " - " (last resort, may be ambiguous)
+    if let Some(idx) = s.find(" - ") {
+        return (s[..idx].trim().to_string(), s[idx + 3..].trim().to_string());
+    }
+    (s.to_string(), String::new())
 }
 
 /// Extract a `[model]` tag from the start of text, falling back to section source.
@@ -501,6 +569,64 @@ mod tests {
     fn parse_decision_log_empty_on_no_entries() {
         let entries = parse_decision_log("No decisions here, just text.");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_decision_log_bold_markers() {
+        let text = r#"## Decision Log
+### Claude (conceptual-risk)
+- **ACCEPT**: Missing error handling -- Fixed in revised plan
+- **PARTIAL:** Coupling issue -- Scoped to module boundary
+- **REJECT**: Remove caching -- Essential for performance
+
+## Revised Plan
+..."#;
+        let entries = parse_decision_log(text);
+        assert_eq!(entries.len(), 3);
+        assert!(matches!(entries[0].disposition, Disposition::Accept));
+        assert!(matches!(entries[1].disposition, Disposition::Partial));
+        assert!(matches!(entries[2].disposition, Disposition::Reject));
+        assert_eq!(entries[0].source_model.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn parse_decision_log_numbered_list() {
+        let text = r#"## Decision Log
+### Gemini (implementation-risk)
+1. ACCEPT: No rate limiting -- Added basic rate limiter
+2. PARTIAL: Missing retry logic -- Added timeout only
+
+## Revised Plan
+..."#;
+        let entries = parse_decision_log(text);
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0].disposition, Disposition::Accept));
+        assert_eq!(entries[0].issue, "No rate limiting");
+        assert_eq!(entries[0].source_model.as_deref(), Some("gemini"));
+    }
+
+    #[test]
+    fn parse_decision_log_asterisk_bullets() {
+        let text = "* ACCEPT: Issue one -- Rationale one\n* REJECT: Issue two -- Rationale two";
+        let entries = parse_decision_log(text);
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn parse_decision_log_em_dash_separator() {
+        let text = "- ACCEPT: Missing validation — Added input checks";
+        let entries = parse_decision_log(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].issue, "Missing validation");
+        assert_eq!(entries[0].rationale, "Added input checks");
+    }
+
+    #[test]
+    fn parse_decision_log_accept_dash_format() {
+        let text = "- ACCEPT - Missing validation -- Added input checks";
+        let entries = parse_decision_log(text);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].issue, "Missing validation");
     }
 
     #[test]

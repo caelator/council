@@ -306,20 +306,27 @@ Return EXACTLY two sections in this format:
 
 ## Decision Log
 Group decisions by source reviewer using ### subheadings.
-Use this EXACT format (one line per decision):
+Each decision MUST be a markdown bullet starting with `- ACCEPT:`, `- PARTIAL:`,
+or `- REJECT:`, followed by the issue summary, then ` -- `, then a one-sentence rationale.
+Copy the issue text from the critique's "issue" field so it can be matched back.
+
+Example (follow this format exactly):
 
 ### Claude (conceptual-risk)
-- ACCEPT: <issue summary> -- <rationale>
-- PARTIAL: <issue summary> -- <rationale>
-- REJECT: <issue summary> -- <rationale>
+- ACCEPT: No input validation on key size -- Added 256-byte key limit
+- PARTIAL: Missing retry logic -- Added timeout but not full retry
+- REJECT: Remove caching entirely -- Caching is essential for performance
 
 ### Gemini (implementation-risk)
-- ACCEPT: <issue summary> -- <rationale>
-- PARTIAL: <issue summary> -- <rationale>
-- REJECT: <issue summary> -- <rationale>
+- ACCEPT: No error handling for network failures -- Added connection timeout
+- ACCEPT: Missing rate limiting -- Added basic rate limiter
 
-You MUST address every critique point listed above. Do not skip any.
-Keep rationales to one sentence each.
+IMPORTANT formatting rules:
+- Every line starts with `- ` then `ACCEPT:` or `PARTIAL:` or `REJECT:` (uppercase)
+- The issue summary comes right after the colon
+- Use ` -- ` (space-dash-dash-space) to separate issue from rationale
+- You MUST address every critique point listed above. Do not skip any.
+- Keep rationales to one sentence each.
 
 ## Revised Plan
 The updated plan with accepted changes incorporated. Mark changed sections

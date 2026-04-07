@@ -358,6 +358,7 @@ mod tests {
             critiques_rejected: Some(rejected),
             high_severity_submitted: Some(1),
             high_severity_accepted: Some(1.min(accepted)),
+            critiques_unmatched: Some(0),
             output_bytes: 1_200,
             parse_success,
         }

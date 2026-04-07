@@ -36,6 +36,7 @@ struct Config {
     plans_file: PathBuf,
     learnings_file: PathBuf,
     metrics_file: PathBuf,
+    fit_scores_file: PathBuf,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -115,6 +116,7 @@ fn main() -> anyhow::Result<()> {
         plans_file: memoryport.join("council-plans.jsonl"),
         learnings_file: memoryport.join("council-learnings.jsonl"),
         metrics_file: memoryport.join("council-metrics.jsonl"),
+        fit_scores_file: memoryport.join("council-fit-scores.jsonl"),
     };
 
     if resume {
@@ -673,6 +675,27 @@ fn main() -> anyhow::Result<()> {
             fit.sample_count,
         );
     }
+
+    // Persist fit scores to JSONL for cross-run querying
+    for fit in &role_fitness {
+        let record = serde_json::json!({
+            "run_id": config.run_id,
+            "timestamp": iso_now(),
+            "model": fit.model,
+            "role": fit.role,
+            "score": fit.score,
+            "confidence": fit.confidence,
+            "sample_count": fit.sample_count,
+        });
+        if let Err(e) = append_jsonl(&config.fit_scores_file, &record) {
+            eprintln!("  [warn] failed to write fit score: {e}");
+        }
+    }
+    eprintln!(
+        "  Fit scores: {} records written to {}",
+        role_fitness.len(),
+        config.fit_scores_file.display()
+    );
 
     // ── Summary ───────────────────────────────────────────────────────
     let summary = ContextPayload {
