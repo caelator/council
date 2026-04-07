@@ -39,8 +39,7 @@ pub fn run_model(model: Model, prompt: &str, workdir: &Path) -> io::Result<Model
             .current_dir(workdir)
             .output(),
         Model::Codex => Command::new("codex")
-            .args(["exec", "--full-auto", "-C", workdir.to_str().unwrap_or("."), "--skip-git-repo-check", "--add-dir", workdir.to_str().unwrap_or(".")])
-            .arg(prompt)
+            .args(["exec", "--full-auto", "-C", workdir.to_str().unwrap_or("."), "--skip-git-repo-check", "--add-dir", workdir.to_str().unwrap_or("."), "--", prompt])
             .output(),
     }?;
 

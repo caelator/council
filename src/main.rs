@@ -38,7 +38,7 @@ struct Config {
     metrics_file: PathBuf,
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // Support --resume or --context-file as args
@@ -418,7 +418,7 @@ fn main() {
                     model: "all".into(),
                     role: "deliberation".into(),
                 },
-            );
+            )?;
             break;
         }
 
@@ -627,7 +627,7 @@ fn main() {
             .display()
             .to_string(),
     };
-    append_jsonl(&config.trace_file, &run_trace);
+    append_jsonl(&config.trace_file, &run_trace)?;
 
     let plan_content =
         fs::read_to_string(config.council_dir.join("final-plan.md")).unwrap_or_default();
@@ -639,11 +639,11 @@ fn main() {
         plan_markdown: plan_content,
         artifacts_dir: config.council_dir.display().to_string(),
     };
-    append_jsonl(&config.plans_file, &plan_record);
+    append_jsonl(&config.plans_file, &plan_record)?;
 
     // ── Emit per-model metrics ─────────────────────────────────────────
     for m in &run_metrics {
-        append_jsonl(&config.metrics_file, m);
+        append_jsonl(&config.metrics_file, m)?;
     }
     eprintln!(
         "  Metrics: {} records written to {}",
@@ -703,6 +703,7 @@ fn main() {
 
     // Print final plan path to stdout (for scripting)
     println!("{}", config.council_dir.join("final-plan.md").display());
+    Ok(())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

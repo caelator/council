@@ -1,4 +1,5 @@
 use crate::model::Model;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -66,15 +67,20 @@ pub fn iso_now() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-pub fn append_jsonl(path: &Path, value: &impl Serialize) {
+pub fn append_jsonl(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {:?}", parent))?;
     }
-    if let Ok(json) = serde_json::to_string(value) {
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{json}");
-        }
-    }
+    let json = serde_json::to_string(value)
+        .with_context(|| format!("failed to serialize value for {:?}", path))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {:?} for append", path))?;
+    writeln!(file, "{json}").with_context(|| format!("failed to write to {:?}", path))?;
+    Ok(())
 }
 
 pub fn persona_assignment(model: Model, role: &str, phase: &str) -> PersonaAssignment {
