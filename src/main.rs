@@ -80,11 +80,14 @@ fn main() -> anyhow::Result<()> {
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     let mut context_file: Option<String> = None;
+    let mut list_models = false;
     let mut real_args = Vec::new();
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--resume" {
             resume = true;
+        } else if args[i] == "--list-models" {
+            list_models = true;
         } else if args[i] == "--context-file" && i + 1 < args.len() {
             context_file = Some(args[i + 1].clone());
             i += 1;
@@ -94,11 +97,17 @@ fn main() -> anyhow::Result<()> {
         i += 1;
     }
 
+    if list_models {
+        print_model_catalog();
+        return Ok(());
+    }
+
     if real_args.len() < 2 {
-        eprintln!("Usage: council [--resume] [--context-file <path>] <workdir> <task prompt>");
+        eprintln!("Usage: council [--resume] [--list-models] [--context-file <path>] <workdir> <task prompt>");
         eprintln!(
             "Optional env: COUNCIL_ROUNDS (default 2), COUNCIL_DIR, COUNCIL_NAME, COUNCIL_RESUME=1"
         );
+        eprintln!("  Roster overrides: COUNCIL_MODEL_<ROLE>=<model-name>");
         std::process::exit(1);
     }
 
@@ -770,6 +779,58 @@ fn main() -> anyhow::Result<()> {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+fn print_model_catalog() {
+    use crate::provider::free_model_registry;
+
+    println!("═══ Council Model Catalog ═══\n");
+    println!("Local models:");
+    for (model, cmd) in [
+        (Model::Gemini, "gemini"),
+        (Model::Claude, "claude"),
+        (Model::Codex, "codex"),
+        (Model::Gemma31B, "gemma-llama"),
+    ] {
+        let avail = model::check_available(model);
+        let status = if avail { "ok" } else { "not found" };
+        println!("  [{status}] {:<16} (CLI: {cmd})", model.name());
+    }
+
+    println!("\nOpenRouter free-tier models:");
+    let or_available = provider::resolve_openrouter_api_key().is_some();
+    for entry in free_model_registry() {
+        let model = if entry.id == "qwen/qwen3.6-plus" {
+            Model::Qwen36Plus
+        } else {
+            Model::OpenRouterFree(entry.id)
+        };
+        let status = if or_available { "ok" } else { "no key" };
+        let reasoning = if entry.reasoning { " [reasoning]" } else { "" };
+        println!(
+            "  [{status}] {:<28} → {}{reasoning}",
+            model.name(),
+            entry.id,
+        );
+    }
+
+    println!("\nRoster slot overrides (env vars):");
+    let slots = [
+        ("COUNCIL_MODEL_FRAMING_CONTROLLER", "framing-controller", "gemini"),
+        ("COUNCIL_MODEL_SOLUTION_SCOUT", "solution-scout", "gemini"),
+        ("COUNCIL_MODEL_ELEGANCE_SCOUT", "elegance-scout", "claude"),
+        ("COUNCIL_MODEL_FEASIBILITY_SCOUT", "feasibility-scout", "codex"),
+        ("COUNCIL_MODEL_RISK_SCOUT_1", "risk-scout-1", "gemma-llama"),
+        ("COUNCIL_MODEL_RISK_SCOUT_2", "risk-scout-2", "qwen-36-plus"),
+        ("COUNCIL_MODEL_ADVERSARIAL_REVIEWER_CONCEPTUAL_RISK", "adversarial-reviewer/conceptual-risk", "claude"),
+        ("COUNCIL_MODEL_ADVERSARIAL_REVIEWER_IMPLEMENTATION_RISK", "adversarial-reviewer/implementation-risk", "gemini"),
+        ("COUNCIL_MODEL_SYNTHESIS_OWNER", "synthesis-owner", "codex"),
+        ("COUNCIL_MODEL_BUILD_LEAD", "build-lead", "codex"),
+    ];
+    for (env, role, default) in slots {
+        println!("  {env}  (role: {role}, default: {default})");
+    }
+    println!("\nExample: COUNCIL_MODEL_FRAMING_CONTROLLER=deepseek-r1-0528 council ...");
+}
 
 fn run_brainstorm_stage(
     config: &Config,
