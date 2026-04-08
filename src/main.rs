@@ -40,6 +40,38 @@ struct Config {
     fit_scores_file: PathBuf,
 }
 
+/// Resolve a roster slot model, allowing env-var overrides.
+///
+/// For a role like "framing-controller", checks `COUNCIL_MODEL_FRAMING_CONTROLLER`
+/// for a model name or OpenRouter free model ID.  Falls back to `default`.
+///
+/// This lets users swap any roster slot to a free-tier model without code changes:
+///   COUNCIL_MODEL_FRAMING_CONTROLLER=deepseek-r1-0528 council ...
+fn resolve_roster_model(role: &str, default: Model) -> Model {
+    let env_key = format!(
+        "COUNCIL_MODEL_{}",
+        role.to_ascii_uppercase().replace('-', "_").replace('/', "_")
+    );
+    if let Ok(val) = std::env::var(&env_key) {
+        if let Some(m) = Model::from_name(&val) {
+            if m.is_remote() && !model::check_available(m) {
+                eprintln!(
+                    "  [warn] {env_key}={val} resolved but OpenRouter is not available, using default {}",
+                    default.name()
+                );
+                return default;
+            }
+            eprintln!("  [override] {env_key}={val} → {}", m.name());
+            return m;
+        }
+        eprintln!(
+            "  [warn] {env_key}={val} is not a known model, using default {}",
+            default.name()
+        );
+    }
+    default
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -149,17 +181,13 @@ fn main() -> anyhow::Result<()> {
     // Save task
     write_artifact(&config.council_dir, "task.txt", &config.task);
 
-    // Check model availability
-    let models_available = [
-        (Model::Gemini, model::check_available(Model::Gemini)),
-        (Model::Claude, model::check_available(Model::Claude)),
-        (Model::Codex, model::check_available(Model::Codex)),
-        (Model::Gemma31B, model::check_available(Model::Gemma31B)),
-        (Model::Qwen36Plus, model::check_available(Model::Qwen36Plus)),
-    ];
-    for (m, available) in &models_available {
-        if *available {
-            eprintln!("  [ok] {} available", m.name());
+    // Check model availability — enumerate all known models (local + free catalog).
+    let all_models = Model::all_models();
+    for m in &all_models {
+        let available = model::check_available(*m);
+        if available {
+            eprintln!("  [ok] {} available{}", m.name(),
+                if m.is_remote() { " (openrouter)" } else { "" });
         } else {
             eprintln!("  [!!] {} not found", m.name());
         }
@@ -171,7 +199,7 @@ fn main() -> anyhow::Result<()> {
         let profiles = aggregate_profiles(&historical_metrics);
         eprintln!("\n{}", format_scorecard(&profiles));
 
-        // Current hardcoded assignments
+        // Current roster (defaults, before env overrides apply).
         let current_assignments = vec![
             (
                 Model::Claude,
@@ -204,6 +232,13 @@ fn main() -> anyhow::Result<()> {
     let mut personas = Vec::new();
     let mut phases_completed = Vec::new();
 
+    // ── Resolve roster models (env overrides applied here) ────────────
+    let framing_model = resolve_roster_model("framing-controller", Model::Gemini);
+    let conceptual_critic = resolve_roster_model("adversarial-reviewer/conceptual-risk", Model::Claude);
+    let impl_critic = resolve_roster_model("adversarial-reviewer/implementation-risk", Model::Gemini);
+    let synthesis_model = resolve_roster_model("synthesis-owner", Model::Codex);
+    let handoff_model = resolve_roster_model("build-lead", Model::Codex);
+
     // ── Stage 0: Framing ──────────────────────────────────────────────
     eprintln!("\n═══ Stage 0: Framing ═══");
     let framing = if config.resume {
@@ -222,7 +257,7 @@ fn main() -> anyhow::Result<()> {
                 ],
             );
             let f = run_phase_model(
-                Model::Gemini,
+                framing_model,
                 &framing_prompt,
                 &config.workdir,
                 &config.council_dir,
@@ -240,7 +275,7 @@ fn main() -> anyhow::Result<()> {
             ],
         );
         let f = run_phase_model(
-            Model::Gemini,
+            framing_model,
             &framing_prompt,
             &config.workdir,
             &config.council_dir,
@@ -252,7 +287,7 @@ fn main() -> anyhow::Result<()> {
     run_metrics.push(collect_output_metrics(
         &config.run_id,
         &iso_now(),
-        Model::Gemini,
+        framing_model,
         "framing-controller",
         "framing",
         framing.len() as u32,
@@ -260,7 +295,7 @@ fn main() -> anyhow::Result<()> {
     ));
     phases_completed.push("framing".into());
     personas.push(persona_assignment(
-        Model::Gemini,
+        framing_model,
         "framing-controller",
         "framing",
     ));
@@ -341,8 +376,8 @@ fn main() -> anyhow::Result<()> {
         fs::create_dir_all(&round_dir).ok();
         eprintln!("  ── Round {round}/{} ──", config.max_rounds);
 
-        // Claude: conceptual adversary
-        eprintln!("  → Claude: conceptual-adversary");
+        // Conceptual adversary
+        eprintln!("  → {}: conceptual-adversary", conceptual_critic.name());
         let claude_crit_prompt = fmt_prompt(
             phase::CRITIQUE_PROMPT,
             &[
@@ -356,7 +391,7 @@ fn main() -> anyhow::Result<()> {
             ],
         );
         let claude_crit_raw = run_phase_model(
-            Model::Claude,
+            conceptual_critic,
             &claude_crit_prompt,
             &config.workdir,
             &round_dir,
@@ -370,8 +405,8 @@ fn main() -> anyhow::Result<()> {
             &serde_json::to_string_pretty(&claude_critique).unwrap_or_default(),
         );
 
-        // Gemini: novelty/risk adversary
-        eprintln!("  → Gemini: risk-adversary");
+        // Implementation-risk adversary
+        eprintln!("  → {}: risk-adversary", impl_critic.name());
         let gemini_crit_prompt = fmt_prompt(
             phase::CRITIQUE_PROMPT,
             &[
@@ -385,7 +420,7 @@ fn main() -> anyhow::Result<()> {
             ],
         );
         let gemini_crit_raw = run_phase_model(
-            Model::Gemini,
+            impl_critic,
             &gemini_crit_prompt,
             &config.workdir,
             &round_dir,
@@ -427,11 +462,13 @@ fn main() -> anyhow::Result<()> {
             break;
         }
 
-        // Codex: synthesis owner — process critiques and revise plan
-        eprintln!("  → Codex: synthesis-owner (revise plan)");
+        // Synthesis owner — process critiques and revise plan
+        eprintln!("  → {}: synthesis-owner (revise plan)", synthesis_model.name());
         let combined_critiques = format!(
-            "## Claude (conceptual-risk)\n{}\n\n## Gemini (implementation-risk)\n{}",
+            "## {} (conceptual-risk)\n{}\n\n## {} (implementation-risk)\n{}",
+            conceptual_critic.name(),
             serde_json::to_string_pretty(&claude_critique).unwrap_or_default(),
+            impl_critic.name(),
             serde_json::to_string_pretty(&gemini_critique).unwrap_or_default()
         );
         let delib_prompt = fmt_prompt(
@@ -443,7 +480,7 @@ fn main() -> anyhow::Result<()> {
             ],
         );
         let revision = run_phase_model(
-            Model::Codex,
+            synthesis_model,
             &delib_prompt,
             &config.workdir,
             &round_dir,
@@ -505,7 +542,7 @@ fn main() -> anyhow::Result<()> {
         run_metrics.push(collect_critique_metrics(
             &config.run_id,
             &ts,
-            Model::Claude,
+            conceptual_critic,
             "adversarial-reviewer/conceptual-risk",
             "deliberation",
             &claude_critique,
@@ -519,7 +556,7 @@ fn main() -> anyhow::Result<()> {
         run_metrics.push(collect_critique_metrics(
             &config.run_id,
             &ts,
-            Model::Gemini,
+            impl_critic,
             "adversarial-reviewer/implementation-risk",
             "deliberation",
             &gemini_critique,
@@ -533,7 +570,7 @@ fn main() -> anyhow::Result<()> {
         run_metrics.push(collect_output_metrics(
             &config.run_id,
             &ts,
-            Model::Codex,
+            synthesis_model,
             "synthesis-owner",
             "deliberation",
             revision.len() as u32,
@@ -572,7 +609,7 @@ fn main() -> anyhow::Result<()> {
                 &[("plan", &current_plan), ("task", &config.task)],
             );
             run_phase_model(
-                Model::Codex,
+                handoff_model,
                 &handoff_prompt,
                 &config.workdir,
                 &config.council_dir,
@@ -585,7 +622,7 @@ fn main() -> anyhow::Result<()> {
             &[("plan", &current_plan), ("task", &config.task)],
         );
         run_phase_model(
-            Model::Codex,
+            handoff_model,
             &handoff_prompt,
             &config.workdir,
             &config.council_dir,
@@ -595,13 +632,13 @@ fn main() -> anyhow::Result<()> {
     run_metrics.push(collect_output_metrics(
         &config.run_id,
         &iso_now(),
-        Model::Codex,
+        handoff_model,
         "build-lead",
         "handoff",
         handoff.len() as u32,
         handoff.contains("## Implementation Checklist"),
     ));
-    personas.push(persona_assignment(Model::Codex, "build-lead", "handoff"));
+    personas.push(persona_assignment(handoff_model, "build-lead", "handoff"));
 
     write_artifact(&config.council_dir, "final-plan.md", &handoff);
     write_artifact(&config.council_dir, "build-plan-final.md", &current_plan);
@@ -609,9 +646,9 @@ fn main() -> anyhow::Result<()> {
 
     // ── Telemetry ─────────────────────────────────────────────────────
     let ts = iso_now();
-    let models_used: Vec<String> = [Model::Gemini, Model::Claude, Model::Codex, Model::Gemma31B, Model::Qwen36Plus]
-        .iter()
-        .filter(|m| model::check_available(**m))
+    let models_used: Vec<String> = Model::all_models()
+        .into_iter()
+        .filter(|m| model::check_available(*m))
         .map(|m| m.name().into())
         .collect();
 
@@ -741,27 +778,34 @@ fn run_brainstorm_stage(
     personas: &mut Vec<trace::PersonaAssignment>,
     run_metrics: &mut Vec<PhaseMetrics>,
 ) -> String {
-    // Gemini seeds the plan
-    eprintln!("  → Gemini: solution-scout (seed plan)");
+    // Resolve brainstorm roster (env overrides apply).
+    let seed_model = resolve_roster_model("solution-scout", Model::Gemini);
+    let elegance_model = resolve_roster_model("elegance-scout", Model::Claude);
+    let feasibility_model = resolve_roster_model("feasibility-scout", Model::Codex);
+    let risk_scout_1 = resolve_roster_model("risk-scout-1", Model::Gemma31B);
+    let risk_scout_2 = resolve_roster_model("risk-scout-2", Model::Qwen36Plus);
+
+    // Seed the plan
+    eprintln!("  → {}: solution-scout (seed plan)", seed_model.name());
     let seed_prompt = fmt_prompt(
         phase::BRAINSTORM_SEED_PROMPT,
         &[("framing", framing), ("task", &config.task)],
     );
     let seed_plan = run_phase_model(
-        Model::Gemini,
+        seed_model,
         &seed_prompt,
         &config.workdir,
         stage1_dir,
         "gemini-seed",
     );
     personas.push(persona_assignment(
-        Model::Gemini,
+        seed_model,
         "solution-scout",
         "brainstorming",
     ));
 
-    // Claude contributes elegance/reframing
-    eprintln!("  → Claude: elegance-scout (contribute)");
+    // Elegance/reframing contributions
+    eprintln!("  → {}: elegance-scout (contribute)", elegance_model.name());
     let claude_contrib_prompt = fmt_prompt(
         phase::BRAINSTORM_CONTRIBUTE_PROMPT,
         &[
@@ -776,20 +820,20 @@ fn run_brainstorm_stage(
         ],
     );
     let claude_contributions = run_phase_model(
-        Model::Claude,
+        elegance_model,
         &claude_contrib_prompt,
         &config.workdir,
         stage1_dir,
         "claude-contribute",
     );
     personas.push(persona_assignment(
-        Model::Claude,
+        elegance_model,
         "elegance-scout",
         "brainstorming",
     ));
 
-    // Codex contributes feasibility
-    eprintln!("  → Codex: feasibility-scout (contribute)");
+    // Feasibility contributions
+    eprintln!("  → {}: feasibility-scout (contribute)", feasibility_model.name());
     let codex_contrib_prompt = fmt_prompt(
         phase::BRAINSTORM_CONTRIBUTE_PROMPT,
         &[
@@ -804,20 +848,20 @@ fn run_brainstorm_stage(
         ],
     );
     let codex_contributions = run_phase_model(
-        Model::Codex,
+        feasibility_model,
         &codex_contrib_prompt,
         &config.workdir,
         stage1_dir,
         "codex-contribute",
     );
     personas.push(persona_assignment(
-        Model::Codex,
+        feasibility_model,
         "feasibility-scout",
         "brainstorming",
     ));
 
-    // Gemma31B contributes risk/failure-mode analysis
-    eprintln!("  → Gemma31B: risk-scout (contribute)");
+    // Risk/failure-mode analysis (model 1)
+    eprintln!("  → {}: risk-scout (contribute)", risk_scout_1.name());
     let gemma_contrib_prompt = fmt_prompt(
         phase::BRAINSTORM_CONTRIBUTE_PROMPT,
         &[
@@ -832,20 +876,20 @@ fn run_brainstorm_stage(
         ],
     );
     let gemma_contributions = run_phase_model(
-        Model::Gemma31B,
+        risk_scout_1,
         &gemma_contrib_prompt,
         &config.workdir,
         stage1_dir,
         "gemma-contribute",
     );
     personas.push(persona_assignment(
-        Model::Gemma31B,
+        risk_scout_1,
         "risk-scout",
         "brainstorming",
     ));
 
-    // Qwen 3.6 Plus contributes risk/reasoning analysis via OpenRouter
-    eprintln!("  → Qwen36Plus: risk-scout (contribute)");
+    // Risk/reasoning analysis (model 2, default: Qwen via OpenRouter)
+    eprintln!("  → {}: risk-scout (contribute)", risk_scout_2.name());
     let qwen_contrib_prompt = fmt_prompt(
         phase::BRAINSTORM_CONTRIBUTE_PROMPT,
         &[
@@ -860,14 +904,14 @@ fn run_brainstorm_stage(
         ],
     );
     let qwen_contributions = run_phase_model(
-        Model::Qwen36Plus,
+        risk_scout_2,
         &qwen_contrib_prompt,
         &config.workdir,
         stage1_dir,
         "qwen-contribute",
     );
     personas.push(persona_assignment(
-        Model::Qwen36Plus,
+        risk_scout_2,
         "risk-scout",
         "brainstorming",
     ));
@@ -877,7 +921,7 @@ fn run_brainstorm_stage(
     run_metrics.push(collect_output_metrics(
         &config.run_id,
         &ts,
-        Model::Gemini,
+        seed_model,
         "solution-scout",
         "brainstorming",
         seed_plan.len() as u32,
@@ -886,7 +930,7 @@ fn run_brainstorm_stage(
     run_metrics.push(collect_output_metrics(
         &config.run_id,
         &ts,
-        Model::Claude,
+        elegance_model,
         "elegance-scout",
         "brainstorming",
         claude_contributions.len() as u32,
@@ -895,7 +939,7 @@ fn run_brainstorm_stage(
     run_metrics.push(collect_output_metrics(
         &config.run_id,
         &ts,
-        Model::Codex,
+        feasibility_model,
         "feasibility-scout",
         "brainstorming",
         codex_contributions.len() as u32,
@@ -904,7 +948,7 @@ fn run_brainstorm_stage(
     run_metrics.push(collect_output_metrics(
         &config.run_id,
         &ts,
-        Model::Gemma31B,
+        risk_scout_1,
         "risk-scout",
         "brainstorming",
         gemma_contributions.len() as u32,
@@ -913,7 +957,7 @@ fn run_brainstorm_stage(
     run_metrics.push(collect_output_metrics(
         &config.run_id,
         &ts,
-        Model::Qwen36Plus,
+        risk_scout_2,
         "risk-scout",
         "brainstorming",
         qwen_contributions.len() as u32,
@@ -921,19 +965,21 @@ fn run_brainstorm_stage(
     ));
 
     // Synthesize
-    eprintln!("  → Gemini: synthesizing contributions");
+    eprintln!("  → {}: synthesizing contributions", seed_model.name());
     let synth_prompt = format!(
         "You are the brainstorming lead synthesizing contributions into a revised plan.\n\n\
          Original plan:\n{seed_plan}\n\n\
          Elegance contributions:\n{claude_contributions}\n\n\
          Feasibility contributions:\n{codex_contributions}\n\n\
-         Risk/failure-mode contributions (Gemma):\n{gemma_contributions}\n\n\
-         Risk/failure-mode contributions (Qwen):\n{qwen_contributions}\n\n\
+         Risk/failure-mode contributions ({}):\n{gemma_contributions}\n\n\
+         Risk/failure-mode contributions ({}):\n{qwen_contributions}\n\n\
          Integrate the valuable suggestions. Produce the revised complete plan.\n\
-         Mark sections that changed with [CHANGED] tags."
+         Mark sections that changed with [CHANGED] tags.",
+        risk_scout_1.name(),
+        risk_scout_2.name(),
     );
     let brainstorm_plan = run_phase_model(
-        Model::Gemini,
+        seed_model,
         &synth_prompt,
         &config.workdir,
         stage1_dir,

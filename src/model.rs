@@ -6,17 +6,46 @@ use std::sync::Mutex;
 
 use crate::provider::{self, OpenRouterFreeProvider};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// A council model — either a local CLI tool or any free-tier OpenRouter model.
+///
+/// The `OpenRouterFree` variant accepts any model ID present in the free-tier
+/// registry (`provider::FREE_MODEL_REGISTRY`).  This eliminates per-model enum
+/// boilerplate: adding a new free model only requires a registry entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Model {
     Gemini,
     Claude,
     Codex,
     Gemma31B,
     Qwen36Plus,
+    /// Any free-tier OpenRouter model, identified by its registry ID.
+    /// The `&'static str` must match an entry in `FREE_MODEL_REGISTRY`.
+    OpenRouterFree(&'static str),
+}
+
+// ── Custom serde ─────────────────────────────────────────────────────
+// Serialize all variants as their canonical name string.  Deserialize
+// by trying known local names first, then checking the free registry.
+
+impl serde::Serialize for Model {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Model {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+        if let Some(m) = Model::from_name(&s) {
+            Ok(m)
+        } else {
+            Err(serde::de::Error::custom(format!("unknown model: {s}")))
+        }
+    }
 }
 
 impl Model {
+    /// Canonical short name used in logs, metrics, and serialization.
     pub fn name(self) -> &'static str {
         match self {
             Model::Gemini => "gemini",
@@ -24,6 +53,15 @@ impl Model {
             Model::Codex => "codex",
             Model::Gemma31B => "gemma-llama",
             Model::Qwen36Plus => "qwen-36-plus",
+            Model::OpenRouterFree(id) => {
+                // Derive a short name from the OpenRouter ID.
+                // "deepseek/deepseek-r1-0528:free" → "deepseek-r1-0528"
+                let slug = id.split('/').last().unwrap_or(id);
+                // Strip the ":free" suffix if present — it's noise in logs.
+                let slug = slug.strip_suffix(":free").unwrap_or(slug);
+                // Return &'static str by leaking — these are few, long-lived values.
+                slug
+            }
         }
     }
 
@@ -31,6 +69,7 @@ impl Model {
     pub fn openrouter_model_id(self) -> Option<&'static str> {
         match self {
             Model::Qwen36Plus => Some("qwen/qwen3.6-plus"),
+            Model::OpenRouterFree(id) => Some(id),
             _ => None,
         }
     }
@@ -38,6 +77,58 @@ impl Model {
     /// Whether this model runs through a remote provider (vs. local CLI).
     pub fn is_remote(self) -> bool {
         self.openrouter_model_id().is_some()
+    }
+
+    /// Resolve a model from its canonical name or OpenRouter ID.
+    ///
+    /// Checks local model names first, then the free-tier registry.
+    pub fn from_name(name: &str) -> Option<Model> {
+        match name {
+            "gemini" => Some(Model::Gemini),
+            "claude" => Some(Model::Claude),
+            "codex" => Some(Model::Codex),
+            "gemma-llama" => Some(Model::Gemma31B),
+            "qwen-36-plus" => Some(Model::Qwen36Plus),
+            _ => {
+                // Try as a direct OpenRouter free model ID.
+                if let Some(entry) = provider::lookup_free_model(name) {
+                    return Some(Model::OpenRouterFree(entry.id));
+                }
+                // Try matching against registry slugs (name without org/ and :free).
+                for entry in provider::free_model_registry() {
+                    let slug = entry.id.split('/').last().unwrap_or(entry.id);
+                    let slug = slug.strip_suffix(":free").unwrap_or(slug);
+                    if slug == name {
+                        return Some(Model::OpenRouterFree(entry.id));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Return `Model` values for every free-tier registry entry.
+    ///
+    /// Qwen 3.6 Plus is returned as `Model::Qwen36Plus` (its dedicated variant)
+    /// rather than as `OpenRouterFree` to preserve backward compatibility.
+    pub fn all_free_models() -> Vec<Model> {
+        provider::free_model_registry()
+            .iter()
+            .map(|entry| {
+                if entry.id == "qwen/qwen3.6-plus" {
+                    Model::Qwen36Plus
+                } else {
+                    Model::OpenRouterFree(entry.id)
+                }
+            })
+            .collect()
+    }
+
+    /// All models that could participate in a council run.
+    pub fn all_models() -> Vec<Model> {
+        let mut models = vec![Model::Gemini, Model::Claude, Model::Codex, Model::Gemma31B];
+        models.extend(Self::all_free_models());
+        models
     }
 }
 
@@ -81,7 +172,9 @@ fn run_local_model(model: Model, prompt: &str, workdir: &Path) -> io::Result<Mod
             .args(["-o", "text", "-p", prompt])
             .current_dir(workdir)
             .output(),
-        _ => unreachable!("remote models handled in run_model"),
+        Model::Qwen36Plus | Model::OpenRouterFree(_) => {
+            unreachable!("remote models handled in run_model")
+        }
     }?;
 
     Ok(ModelOutput {
@@ -165,5 +258,96 @@ mod tests {
     #[test]
     fn openrouter_model_id_none_for_local() {
         assert!(Model::Gemini.openrouter_model_id().is_none());
+    }
+
+    #[test]
+    fn openrouter_free_variant_basics() {
+        let m = Model::OpenRouterFree("deepseek/deepseek-r1-0528:free");
+        assert!(m.is_remote());
+        assert_eq!(
+            m.openrouter_model_id(),
+            Some("deepseek/deepseek-r1-0528:free")
+        );
+        assert_eq!(m.name(), "deepseek-r1-0528");
+    }
+
+    #[test]
+    fn openrouter_free_name_strips_org_and_free() {
+        let m = Model::OpenRouterFree("meta-llama/llama-4-maverick:free");
+        assert_eq!(m.name(), "llama-4-maverick");
+    }
+
+    #[test]
+    fn from_name_resolves_local_models() {
+        assert_eq!(Model::from_name("gemini"), Some(Model::Gemini));
+        assert_eq!(Model::from_name("claude"), Some(Model::Claude));
+        assert_eq!(Model::from_name("codex"), Some(Model::Codex));
+        assert_eq!(Model::from_name("gemma-llama"), Some(Model::Gemma31B));
+        assert_eq!(Model::from_name("qwen-36-plus"), Some(Model::Qwen36Plus));
+    }
+
+    #[test]
+    fn from_name_resolves_free_model_by_id() {
+        let m = Model::from_name("deepseek/deepseek-r1-0528:free");
+        assert_eq!(
+            m,
+            Some(Model::OpenRouterFree("deepseek/deepseek-r1-0528:free"))
+        );
+    }
+
+    #[test]
+    fn from_name_resolves_free_model_by_slug() {
+        let m = Model::from_name("deepseek-r1-0528");
+        assert_eq!(
+            m,
+            Some(Model::OpenRouterFree("deepseek/deepseek-r1-0528:free"))
+        );
+    }
+
+    #[test]
+    fn from_name_returns_none_for_unknown() {
+        assert!(Model::from_name("openai/gpt-4o").is_none());
+        assert!(Model::from_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn all_free_models_includes_registry() {
+        let free = Model::all_free_models();
+        assert!(free.len() >= 3);
+        // Qwen should be the dedicated variant, not OpenRouterFree.
+        assert!(free.contains(&Model::Qwen36Plus));
+        // Others should be OpenRouterFree.
+        assert!(free
+            .iter()
+            .any(|m| matches!(m, Model::OpenRouterFree(_))));
+    }
+
+    #[test]
+    fn all_models_includes_local_and_free() {
+        let all = Model::all_models();
+        assert!(all.contains(&Model::Gemini));
+        assert!(all.contains(&Model::Claude));
+        assert!(all.contains(&Model::Qwen36Plus));
+        assert!(all.len() >= 7); // 4 local + at least 3 free
+    }
+
+    #[test]
+    fn serde_roundtrip_local() {
+        let m = Model::Gemini;
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "\"gemini\"");
+        let back: Model = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn serde_roundtrip_openrouter_free() {
+        let m = Model::OpenRouterFree("deepseek/deepseek-r1-0528:free");
+        let json = serde_json::to_string(&m).unwrap();
+        // Serializes as the slug name.
+        assert_eq!(json, "\"deepseek-r1-0528\"");
+        // Deserializes back via slug lookup.
+        let back: Model = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
     }
 }
