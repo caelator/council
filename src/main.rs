@@ -153,6 +153,7 @@ fn main() -> anyhow::Result<()> {
         (Model::Gemini, model::check_available(Model::Gemini)),
         (Model::Claude, model::check_available(Model::Claude)),
         (Model::Codex, model::check_available(Model::Codex)),
+        (Model::Gemma31B, model::check_available(Model::Gemma31B)),
     ];
     for (m, available) in &models_available {
         if *available {
@@ -606,7 +607,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Telemetry ─────────────────────────────────────────────────────
     let ts = iso_now();
-    let models_used: Vec<String> = [Model::Gemini, Model::Claude, Model::Codex]
+    let models_used: Vec<String> = [Model::Gemini, Model::Claude, Model::Codex, Model::Gemma31B]
         .iter()
         .filter(|m| model::check_available(**m))
         .map(|m| m.name().into())
@@ -813,6 +814,34 @@ fn run_brainstorm_stage(
         "brainstorming",
     ));
 
+    // Gemma31B contributes risk/failure-mode analysis
+    eprintln!("  → Gemma31B: risk-scout (contribute)");
+    let gemma_contrib_prompt = fmt_prompt(
+        phase::BRAINSTORM_CONTRIBUTE_PROMPT,
+        &[
+            ("role", "risk-scout"),
+            (
+                "role_description",
+                "Identify failure modes, edge cases, and what could go wrong with this plan",
+            ),
+            ("framing", framing),
+            ("plan", &seed_plan),
+            ("task", &config.task),
+        ],
+    );
+    let gemma_contributions = run_phase_model(
+        Model::Gemma31B,
+        &gemma_contrib_prompt,
+        &config.workdir,
+        stage1_dir,
+        "gemma-contribute",
+    );
+    personas.push(persona_assignment(
+        Model::Gemma31B,
+        "risk-scout",
+        "brainstorming",
+    ));
+
     // Record brainstorm contributor metrics
     let ts = iso_now();
     run_metrics.push(collect_output_metrics(
@@ -842,6 +871,15 @@ fn run_brainstorm_stage(
         codex_contributions.len() as u32,
         codex_contributions.len() > 20,
     ));
+    run_metrics.push(collect_output_metrics(
+        &config.run_id,
+        &ts,
+        Model::Gemma31B,
+        "risk-scout",
+        "brainstorming",
+        gemma_contributions.len() as u32,
+        gemma_contributions.len() > 20,
+    ));
 
     // Synthesize
     eprintln!("  → Gemini: synthesizing contributions");
@@ -850,6 +888,7 @@ fn run_brainstorm_stage(
          Original plan:\n{seed_plan}\n\n\
          Elegance contributions:\n{claude_contributions}\n\n\
          Feasibility contributions:\n{codex_contributions}\n\n\
+         Risk/failure-mode contributions:\n{gemma_contributions}\n\n\
          Integrate the valuable suggestions. Produce the revised complete plan.\n\
          Mark sections that changed with [CHANGED] tags."
     );

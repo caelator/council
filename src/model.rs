@@ -10,6 +10,7 @@ pub enum Model {
     Gemini,
     Claude,
     Codex,
+    Gemma31B,
 }
 
 impl Model {
@@ -18,6 +19,7 @@ impl Model {
             Model::Gemini => "gemini",
             Model::Claude => "claude",
             Model::Codex => "codex",
+            Model::Gemma31B => "gemma-llama",
         }
     }
 }
@@ -40,6 +42,10 @@ pub fn run_model(model: Model, prompt: &str, workdir: &Path) -> io::Result<Model
             .output(),
         Model::Codex => Command::new("codex")
             .args(["exec", "--full-auto", "-C", workdir.to_str().unwrap_or("."), "--skip-git-repo-check", "--add-dir", workdir.to_str().unwrap_or("."), "--", prompt])
+            .output(),
+        Model::Gemma31B => Command::new("gemma-llama")
+            .args(["-o", "text", "-p", prompt])
+            .current_dir(workdir)
             .output(),
     }?;
 
