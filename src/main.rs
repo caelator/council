@@ -1,3 +1,4 @@
+mod blob_writer;
 mod critique;
 mod metrics;
 mod model;
@@ -21,9 +22,9 @@ use model_role_fit::RoleFitness;
 use phase::fmt_prompt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use blob_writer::dual_write_jsonl;
 use trace::{
-    LearningRecord, PlanRecord, RunTrace, append_jsonl, generate_run_id, iso_now,
-    persona_assignment,
+    LearningRecord, PlanRecord, RunTrace, generate_run_id, iso_now, persona_assignment,
 };
 
 struct Config {
@@ -456,7 +457,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!("  → Converged: all critiques are low severity");
             converged = true;
 
-            append_jsonl(
+            dual_write_jsonl(
                 &config.learnings_file,
                 &LearningRecord {
                     run_id: config.run_id.clone(),
@@ -467,6 +468,7 @@ fn main() -> anyhow::Result<()> {
                     model: "all".into(),
                     role: "deliberation".into(),
                 },
+                "council/learning",
             )?;
             break;
         }
@@ -678,7 +680,7 @@ fn main() -> anyhow::Result<()> {
             .display()
             .to_string(),
     };
-    append_jsonl(&config.trace_file, &run_trace)?;
+    dual_write_jsonl(&config.trace_file, &run_trace, "council/trace")?;
 
     let plan_content =
         fs::read_to_string(config.council_dir.join("final-plan.md")).unwrap_or_default();
@@ -690,11 +692,11 @@ fn main() -> anyhow::Result<()> {
         plan_markdown: plan_content,
         artifacts_dir: config.council_dir.display().to_string(),
     };
-    append_jsonl(&config.plans_file, &plan_record)?;
+    dual_write_jsonl(&config.plans_file, &plan_record, "council/plan")?;
 
     // ── Emit per-model metrics ─────────────────────────────────────────
     for m in &run_metrics {
-        append_jsonl(&config.metrics_file, m)?;
+        dual_write_jsonl(&config.metrics_file, m, "council/metrics")?;
     }
     eprintln!(
         "  Metrics: {} records written to {}",
@@ -736,7 +738,7 @@ fn main() -> anyhow::Result<()> {
             "confidence": fit.confidence,
             "sample_count": fit.sample_count,
         });
-        if let Err(e) = append_jsonl(&config.fit_scores_file, &record) {
+        if let Err(e) = dual_write_jsonl(&config.fit_scores_file, &record, "council/fit-score") {
             eprintln!("  [warn] failed to write fit score: {e}");
         }
     }
