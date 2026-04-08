@@ -290,17 +290,86 @@ fn capability_profile(model: &str) -> CapabilityProfile {
             domain: 0.84,
             implementation: 0.78,
         },
-        _ => CapabilityProfile {
-            intelligence: 0.5,
-            context: 0.5,
-            speed: 0.5,
-            cost_efficiency: 0.5,
-            planning: 0.5,
-            critique: 0.5,
-            synthesis: 0.5,
-            domain: 0.5,
-            implementation: 0.5,
-        },
+        _ => openrouter_free_default_profile(model),
+    }
+}
+
+/// Derive a default capability profile for unknown models.
+///
+/// If the model name maps to a known OpenRouter free-tier model (by checking
+/// the provider registry), we generate a reasonable heuristic profile based
+/// on whether the model supports reasoning.  This lets new free models be
+/// added to the registry without requiring a handcrafted profile.
+fn openrouter_free_default_profile(model_name: &str) -> CapabilityProfile {
+    // Try to match council model name back to a registry entry.
+    // Convention: council names like "qwen-36-plus" map to IDs like "qwen/qwen3.6-plus".
+    // For models we don't have an explicit profile for, check if their OpenRouter ID
+    // is in the free registry.
+    if let Some(entry) = crate::provider::lookup_free_model(model_name) {
+        return free_tier_profile(entry.reasoning);
+    }
+
+    // Also check by iterating the registry for partial name matches.
+    // This handles the case where the council model name is derived from the
+    // OpenRouter ID (e.g. "deepseek-r1" matching "deepseek/deepseek-r1-0528:free").
+    for entry in crate::provider::free_model_registry() {
+        let id_lower = entry.id.to_ascii_lowercase();
+        let name_lower = model_name.to_ascii_lowercase();
+        // Match if the model name appears as a substring of the provider ID
+        // (minus the org prefix and :free suffix).
+        let slug = id_lower
+            .split('/')
+            .last()
+            .unwrap_or(&id_lower)
+            .trim_end_matches(":free");
+        if slug.contains(&name_lower) || name_lower.contains(slug) {
+            return free_tier_profile(entry.reasoning);
+        }
+    }
+
+    // Completely unknown model — conservative defaults.
+    CapabilityProfile {
+        intelligence: 0.5,
+        context: 0.5,
+        speed: 0.5,
+        cost_efficiency: 0.5,
+        planning: 0.5,
+        critique: 0.5,
+        synthesis: 0.5,
+        domain: 0.5,
+        implementation: 0.5,
+    }
+}
+
+/// Heuristic capability profile for a free-tier OpenRouter model.
+///
+/// Reasoning models (chain-of-thought) get higher critique/planning scores.
+/// All free-tier models get cost_efficiency = 1.0 and lower speed (remote API).
+fn free_tier_profile(reasoning: bool) -> CapabilityProfile {
+    if reasoning {
+        CapabilityProfile {
+            intelligence: 0.82,
+            context: 0.85,
+            speed: 0.60,      // remote API, free tier
+            cost_efficiency: 1.0, // free tier
+            planning: 0.80,
+            critique: 0.84,   // reasoning models are good critics
+            synthesis: 0.75,
+            domain: 0.78,
+            implementation: 0.72,
+        }
+    } else {
+        CapabilityProfile {
+            intelligence: 0.72,
+            context: 0.80,
+            speed: 0.60,
+            cost_efficiency: 1.0,
+            planning: 0.68,
+            critique: 0.70,
+            synthesis: 0.68,
+            domain: 0.72,
+            implementation: 0.68,
+        }
     }
 }
 
@@ -453,6 +522,31 @@ mod tests {
             .unwrap();
         assert!(orchestrator.score > gemini_orch.score);
         assert_eq!(orchestrator.sample_count, 0);
+    }
+
+    #[test]
+    fn free_tier_profile_reasoning_model_scores_higher_critique() {
+        let reasoning = super::free_tier_profile(true);
+        let standard = super::free_tier_profile(false);
+        assert!(reasoning.critique > standard.critique);
+        assert!(reasoning.planning > standard.planning);
+        assert_eq!(reasoning.cost_efficiency, 1.0);
+        assert_eq!(standard.cost_efficiency, 1.0);
+    }
+
+    #[test]
+    fn openrouter_free_default_matches_registry_entry() {
+        // A model ID directly in the registry should get a free-tier profile
+        let profile = super::openrouter_free_default_profile("deepseek/deepseek-r1-0528:free");
+        assert_eq!(profile.cost_efficiency, 1.0);
+        assert!(profile.critique > 0.8); // reasoning model
+    }
+
+    #[test]
+    fn openrouter_free_default_unknown_gets_conservative() {
+        let profile = super::openrouter_free_default_profile("totally-unknown-model");
+        assert_eq!(profile.cost_efficiency, 0.5);
+        assert_eq!(profile.intelligence, 0.5);
     }
 
     #[test]
