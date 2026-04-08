@@ -100,16 +100,20 @@ fn summarize_telemetry(entries: &[&PhaseMetrics]) -> TelemetrySummary {
         avg(entries.iter().filter_map(|m| m.severity_accuracy())).unwrap_or(0.65);
     let avg_output_size = avg(entries.iter().map(|m| m.output_bytes as f64)).unwrap_or(2_000.0);
     let output_size_score = output_size_fitness(avg_output_size);
+    let avg_unmatched = avg(entries.iter().filter_map(|m| m.unmatched_rate())).unwrap_or(0.0);
+    let match_quality = 1.0 - avg_unmatched;
 
     let score = round3(
-        avg_acceptance * 0.30
-            + avg_severity_accuracy * 0.25
-            + parse_reliability * 0.25
-            + output_size_score * 0.20,
+        avg_acceptance * 0.25
+            + avg_severity_accuracy * 0.20
+            + parse_reliability * 0.20
+            + output_size_score * 0.15
+            + match_quality * 0.20,
     );
 
+    // Confidence drops when unmatched rate is high (data is unreliable)
     let confidence = round3(
-        ((sample_count as f64 / 6.0).min(1.0) * 0.7 + parse_reliability * 0.3).clamp(0.2, 0.99),
+        ((sample_count as f64 / 6.0).min(1.0) * 0.6 + parse_reliability * 0.2 + match_quality * 0.2).clamp(0.2, 0.99),
     );
 
     TelemetrySummary {

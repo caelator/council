@@ -39,14 +39,28 @@ pub struct PhaseMetrics {
 }
 
 impl PhaseMetrics {
-    /// Acceptance rate: fraction of critiques that were ACCEPT or PARTIAL (not REJECT).
+    /// Acceptance rate: fraction of critiques that were ACCEPT or PARTIAL.
+    /// Unmatched critiques (format mismatch) are NOT counted as accepted —
+    /// only explicitly matched ACCEPT/PARTIAL dispositions count.
     pub fn acceptance_rate(&self) -> Option<f64> {
         let submitted = self.critiques_submitted? as f64;
         if submitted == 0.0 {
             return Some(1.0);
         }
-        let rejected = self.critiques_rejected.unwrap_or(0) as f64;
-        Some((submitted - rejected) / submitted)
+        let accepted = self.critiques_accepted.unwrap_or(0) as f64;
+        let partial = self.critiques_partial.unwrap_or(0) as f64;
+        Some((accepted + partial) / submitted)
+    }
+
+    /// Fraction of critiques that could not be matched to any decision entry.
+    /// High values signal decision log format mismatch, not deliberate rejection.
+    pub fn unmatched_rate(&self) -> Option<f64> {
+        let submitted = self.critiques_submitted? as f64;
+        if submitted == 0.0 {
+            return Some(0.0);
+        }
+        let unmatched = self.critiques_unmatched.unwrap_or(0) as f64;
+        Some(unmatched / submitted)
     }
 
     /// Severity accuracy: fraction of HIGH critiques that were accepted (not rejected).
@@ -467,6 +481,8 @@ pub struct ModelRoleFit {
     pub avg_acceptance: f64,
     pub avg_severity_accuracy: f64,
     pub parse_reliability: f64,
+    /// Average fraction of critiques that could not be matched to decision entries.
+    pub avg_unmatched_rate: f64,
     /// Qualitative grade: "excellent", "good", "fair", "poor".
     pub grade: String,
 }
@@ -511,14 +527,28 @@ pub fn score_model_role_fit(metrics: &[PhaseMetrics]) -> Vec<ModelRoleFit> {
             severity_accs.iter().sum::<f64>() / severity_accs.len() as f64
         };
 
+        let unmatched_rates: Vec<f64> = entries
+            .iter()
+            .filter_map(|e| e.unmatched_rate())
+            .collect();
+        let avg_unmatched = if unmatched_rates.is_empty() {
+            0.0
+        } else {
+            unmatched_rates.iter().sum::<f64>() / unmatched_rates.len() as f64
+        };
+
         let parse_success_count = entries.iter().filter(|e| e.parse_success).count();
         let parse_reliability = parse_success_count as f64 / n as f64;
 
+        // Unmatched penalty: high unmatched rate means the scoring data is unreliable,
+        // so we penalize it as a separate signal (not just via lower acceptance).
+        let match_quality = 1.0 - avg_unmatched;
+
         let is_critic = role.contains("adversar") || role.contains("critic");
         let composite = if is_critic {
-            avg_acceptance * 0.4 + avg_severity_acc * 0.4 + parse_reliability * 0.2
+            avg_acceptance * 0.35 + avg_severity_acc * 0.30 + parse_reliability * 0.15 + match_quality * 0.20
         } else {
-            avg_acceptance * 0.2 + parse_reliability * 0.8
+            avg_acceptance * 0.15 + parse_reliability * 0.65 + match_quality * 0.20
         };
 
         let grade = if composite >= 0.85 {
@@ -542,6 +572,7 @@ pub fn score_model_role_fit(metrics: &[PhaseMetrics]) -> Vec<ModelRoleFit> {
             avg_acceptance: round2(avg_acceptance),
             avg_severity_accuracy: round2(avg_severity_acc),
             parse_reliability: round2(parse_reliability),
+            avg_unmatched_rate: round2(avg_unmatched),
             grade: grade.into(),
         });
     }
@@ -569,16 +600,23 @@ pub fn format_fit_report(fits: &[ModelRoleFit]) -> String {
             fit.composite * 100.0
         ));
         out.push_str(&format!(
-            "    Acceptance: {:.0}%  Severity Acc: {:.0}%  Parse: {:.0}%\n",
+            "    Acceptance: {:.0}%  Severity Acc: {:.0}%  Parse: {:.0}%  Unmatched: {:.0}%\n",
             fit.avg_acceptance * 100.0,
             fit.avg_severity_accuracy * 100.0,
             fit.parse_reliability * 100.0,
+            fit.avg_unmatched_rate * 100.0,
         ));
         if fit.zero_acceptance_runs > 0 {
             out.push_str(&format!(
                 "    ⚠ Zero-acceptance runs: {} ({:.0}% of observations)\n",
                 fit.zero_acceptance_runs,
                 fit.zero_acceptance_rate * 100.0,
+            ));
+        }
+        if fit.avg_unmatched_rate > 0.3 {
+            out.push_str(&format!(
+                "    ⚠ High unmatched rate: {:.0}% — likely format mismatch, not rejection\n",
+                fit.avg_unmatched_rate * 100.0,
             ));
         }
         out.push('\n');
@@ -635,9 +673,10 @@ fn fuzzy_match(needle: &str, haystack: &str) -> bool {
     }
 
     // Word overlap: if >= 35% of significant words match
+    // Threshold >2 (not >3) to keep short tech terms like "API", "OOM", "SQL", "CLI"
     let needle_words: Vec<&str> = needle_norm
         .split_whitespace()
-        .filter(|w| w.len() > 3) // skip short words
+        .filter(|w| w.len() > 2) // skip only very short words (a, an, is, to, etc.)
         .collect();
 
     if needle_words.is_empty() {
@@ -973,11 +1012,99 @@ mod tests {
             avg_acceptance: 0.10,
             avg_severity_accuracy: 0.50,
             parse_reliability: 1.0,
+            avg_unmatched_rate: 0.60,
             grade: "poor".into(),
         }];
         let report = format_fit_report(&fits);
         assert!(report.contains("Zero-acceptance runs: 3"));
         assert!(report.contains("zero-acceptance"));
         assert!(report.contains("codex"));
+        assert!(report.contains("High unmatched rate"));
+    }
+
+    #[test]
+    fn acceptance_rate_excludes_unmatched() {
+        // 5 submitted, 0 accepted, 0 rejected, 5 unmatched (format mismatch)
+        let m = PhaseMetrics {
+            run_id: "test".into(),
+            timestamp: "2026-04-08T00:00:00Z".into(),
+            model: "codex".into(),
+            role: "synthesis".into(),
+            phase: "deliberation".into(),
+            critiques_submitted: Some(5),
+            critiques_accepted: Some(0),
+            critiques_partial: Some(0),
+            critiques_rejected: Some(0),
+            high_severity_submitted: Some(0),
+            high_severity_accepted: Some(0),
+            critiques_unmatched: Some(5),
+            output_bytes: 1000,
+            parse_success: true,
+        };
+        // Previously this returned 1.0 (bug: unmatched treated as accepted)
+        // Now correctly returns 0.0
+        assert!((m.acceptance_rate().unwrap() - 0.0).abs() < 0.01);
+        assert!((m.unmatched_rate().unwrap() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn acceptance_rate_with_partial_matches() {
+        // 6 submitted: 2 accepted, 1 partial, 1 rejected, 2 unmatched
+        let m = PhaseMetrics {
+            run_id: "test".into(),
+            timestamp: "2026-04-08T00:00:00Z".into(),
+            model: "claude".into(),
+            role: "adversary".into(),
+            phase: "deliberation".into(),
+            critiques_submitted: Some(6),
+            critiques_accepted: Some(2),
+            critiques_partial: Some(1),
+            critiques_rejected: Some(1),
+            high_severity_submitted: Some(0),
+            high_severity_accepted: Some(0),
+            critiques_unmatched: Some(2),
+            output_bytes: 1000,
+            parse_success: true,
+        };
+        // (2 + 1) / 6 = 0.5
+        assert!((m.acceptance_rate().unwrap() - 0.5).abs() < 0.01);
+        assert!((m.unmatched_rate().unwrap() - 0.333).abs() < 0.01);
+    }
+
+    #[test]
+    fn score_model_role_fit_penalizes_high_unmatched() {
+        let metrics = vec![
+            // All unmatched (format mismatch) — acceptance = 0, unmatched = 100%
+            PhaseMetrics {
+                run_id: "r1".into(),
+                timestamp: "2026-04-08T00:00:00Z".into(),
+                model: "codex".into(),
+                role: "synthesis-owner".into(),
+                phase: "deliberation".into(),
+                critiques_submitted: Some(5),
+                critiques_accepted: Some(0),
+                critiques_partial: Some(0),
+                critiques_rejected: Some(0),
+                high_severity_submitted: Some(0),
+                high_severity_accepted: Some(0),
+                critiques_unmatched: Some(5),
+                output_bytes: 1200,
+                parse_success: true,
+            },
+        ];
+        let fits = score_model_role_fit(&metrics);
+        let fit = fits.iter().find(|f| f.model == "codex").unwrap();
+        assert!((fit.avg_unmatched_rate - 1.0).abs() < 0.01);
+        // Composite should be penalized significantly
+        assert!(fit.composite < 0.65, "composite should be poor with all unmatched: {}", fit.composite);
+        assert!(fit.grade == "poor" || fit.grade == "fair");
+    }
+
+    #[test]
+    fn fuzzy_match_short_tech_terms() {
+        // These short technical terms should now match (threshold lowered from >3 to >2)
+        assert!(fuzzy_match("API timeout", "API request timeout handling"));
+        assert!(fuzzy_match("SQL injection risk", "SQL injection vulnerability in query builder"));
+        assert!(fuzzy_match("OOM risk", "Out-of-memory OOM risk under load"));
     }
 }
