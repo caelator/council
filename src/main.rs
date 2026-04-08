@@ -3,6 +3,7 @@ mod metrics;
 mod model;
 mod model_role_fit;
 mod phase;
+mod provider;
 mod trace;
 
 use critique::{
