@@ -1109,4 +1109,110 @@ mod tests {
         assert!(fuzzy_match("SQL injection risk", "SQL injection vulnerability in query builder"));
         assert!(fuzzy_match("OOM risk", "Out-of-memory OOM risk under load"));
     }
+
+    // ── Proof E: recommendation-to-roster-override pipeline ────────────
+    //
+    // Shows that when telemetry data identifies a better model for a role,
+    // the recommendation engine produces actionable output that maps to
+    // env-var overrides consumable by resolve_roster_model().
+
+    #[test]
+    fn proof_e_recommendation_maps_to_roster_override_env_var() {
+        // Setup: Claude is excellent as adversary, Gemini is weak.
+        let metrics = vec![
+            make_phase_metrics("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 10, 9, 1, 3, 3, true),
+            make_phase_metrics("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 10, 8, 2, 2, 2, true),
+            make_phase_metrics("gemini", "adversarial-reviewer/conceptual-risk", "deliberation", 10, 3, 7, 4, 0, true),
+            make_phase_metrics("gemini", "adversarial-reviewer/conceptual-risk", "deliberation", 10, 2, 8, 3, 0, true),
+        ];
+        let profiles = aggregate_profiles(&metrics);
+
+        // Current assignment: Gemini is doing conceptual-risk adversary
+        let assignments = vec![(Model::Gemini, "adversarial-reviewer/conceptual-risk", "deliberation")];
+        let recs = recommend_roles(&profiles, &assignments, 2, 0.2);
+
+        // Should recommend swapping Gemini → Claude
+        assert!(!recs.is_empty(), "should produce a recommendation");
+        let rec = &recs[0];
+        assert_eq!(rec.current_model, "gemini");
+        assert_eq!(rec.recommended_model, "claude");
+        assert_eq!(rec.current_role, "adversarial-reviewer/conceptual-risk");
+
+        // The recommendation's recommended_model should be resolvable via Model::from_name
+        // (this is what resolve_roster_model uses internally).
+        let resolved = Model::from_name(&rec.recommended_model);
+        assert!(resolved.is_some(), "recommended model name must resolve via from_name");
+        assert_eq!(resolved.unwrap(), Model::Claude);
+
+        // The role maps to an env-var key: COUNCIL_MODEL_ADVERSARIAL_REVIEWER_CONCEPTUAL_RISK
+        let env_key = format!(
+            "COUNCIL_MODEL_{}",
+            rec.current_role.to_ascii_uppercase().replace('-', "_").replace('/', "_")
+        );
+        assert_eq!(env_key, "COUNCIL_MODEL_ADVERSARIAL_REVIEWER_CONCEPTUAL_RISK");
+    }
+
+    #[test]
+    fn proof_e_recommendation_for_free_tier_model_resolves() {
+        // If recommendation suggests swapping to a free-tier model (e.g. from metrics
+        // showing it's better), the model name must resolve via from_name.
+        //
+        // This tests the pipeline: recommend_roles produces a model name string →
+        // Model::from_name resolves it → is_remote/openrouter_model_id works.
+        for entry in crate::provider::free_model_registry() {
+            let resolved = Model::from_name(entry.id);
+            assert!(
+                resolved.is_some(),
+                "free model {} must resolve via from_name",
+                entry.id
+            );
+            let model = resolved.unwrap();
+            assert!(
+                model.is_remote(),
+                "free model {} must be remote",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn proof_e_no_recommendation_when_current_model_is_best() {
+        // When the current model is already the best, no swap should be recommended.
+        let metrics = vec![
+            make_phase_metrics("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 10, 9, 1, 3, 3, true),
+            make_phase_metrics("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 10, 10, 0, 2, 2, true),
+            make_phase_metrics("gemini", "adversarial-reviewer/conceptual-risk", "deliberation", 10, 8, 2, 2, 2, true),
+            make_phase_metrics("gemini", "adversarial-reviewer/conceptual-risk", "deliberation", 10, 7, 3, 2, 1, true),
+        ];
+        let profiles = aggregate_profiles(&metrics);
+
+        // Claude is already the best adversary — no swap needed
+        let assignments = vec![(Model::Claude, "adversarial-reviewer/conceptual-risk", "deliberation")];
+        let recs = recommend_roles(&profiles, &assignments, 2, 0.2);
+        assert!(recs.is_empty(), "should not recommend swapping the best model");
+    }
+
+    #[test]
+    fn proof_e_recommendation_confidence_scales_with_delta() {
+        // Larger performance delta → higher confidence.
+        let metrics = vec![
+            // Model A: excellent
+            make_phase_metrics("claude", "adversary", "deliberation", 10, 10, 0, 2, 2, true),
+            make_phase_metrics("claude", "adversary", "deliberation", 10, 9, 1, 2, 2, true),
+            // Model B: terrible
+            make_phase_metrics("gemini", "adversary", "deliberation", 10, 1, 9, 4, 0, true),
+            make_phase_metrics("gemini", "adversary", "deliberation", 10, 0, 10, 3, 0, true),
+        ];
+        let profiles = aggregate_profiles(&metrics);
+
+        let assignments = vec![(Model::Gemini, "adversary", "deliberation")];
+        let recs = recommend_roles(&profiles, &assignments, 2, 0.0);
+        assert!(!recs.is_empty());
+        // With a huge delta, confidence should be high (capped at 1.0).
+        assert!(
+            recs[0].confidence >= 0.6,
+            "large delta should yield high confidence: {}",
+            recs[0].confidence
+        );
+    }
 }

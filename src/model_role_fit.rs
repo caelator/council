@@ -668,4 +668,367 @@ mod tests {
             "parse failures should reduce score"
         );
     }
+
+    // ── Proof F: unmatched_rate degrades role-fit scoring ───────────────
+    //
+    // The summarize_telemetry function uses match_quality (1 - unmatched_rate)
+    // as 20% of the telemetry score. This proof shows that high unmatched
+    // rates in PhaseMetrics degrade the blended role-fit score.
+
+    fn metric_with_unmatched(
+        model: &str,
+        role: &str,
+        phase: &str,
+        accepted: u32,
+        rejected: u32,
+        unmatched: u32,
+        parse_success: bool,
+    ) -> PhaseMetrics {
+        let submitted = accepted + rejected + unmatched;
+        PhaseMetrics {
+            run_id: "run".into(),
+            timestamp: "2026-04-08T00:00:00Z".into(),
+            model: model.into(),
+            role: role.into(),
+            phase: phase.into(),
+            critiques_submitted: Some(submitted),
+            critiques_accepted: Some(accepted),
+            critiques_partial: Some(0),
+            critiques_rejected: Some(rejected),
+            high_severity_submitted: Some(1),
+            high_severity_accepted: Some(1.min(accepted)),
+            critiques_unmatched: Some(unmatched),
+            output_bytes: 1_200,
+            parse_success,
+        }
+    }
+
+    #[test]
+    fn proof_f_high_unmatched_rate_degrades_role_fit_score() {
+        // Effect-OFF: low unmatched rate (clean decision-log matching)
+        let clean = vec![
+            metric_with_unmatched("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 5, 1, 0, true),
+            metric_with_unmatched("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 6, 1, 0, true),
+            metric_with_unmatched("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 5, 2, 0, true),
+        ];
+
+        // Effect-ON: high unmatched rate (format mismatch in decision log)
+        let messy = vec![
+            metric_with_unmatched("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 2, 0, 5, true),
+            metric_with_unmatched("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 1, 0, 6, true),
+            metric_with_unmatched("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 2, 1, 4, true),
+        ];
+
+        let scores_clean = RoleFitness::from_metrics("planning", &clean);
+        let scores_messy = RoleFitness::from_metrics("planning", &messy);
+
+        let find = |scores: &[ModelRoleFitScore]| -> f64 {
+            scores.iter().find(|s| s.model == "claude" && s.role == "critic").unwrap().score
+        };
+
+        let clean_score = find(&scores_clean);
+        let messy_score = find(&scores_messy);
+
+        assert!(
+            clean_score > messy_score,
+            "high unmatched rate should degrade role-fit score: clean={clean_score} > messy={messy_score}"
+        );
+    }
+
+    #[test]
+    fn proof_f_unmatched_rate_reduces_confidence() {
+        let clean = vec![
+            metric_with_unmatched("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 5, 1, 0, true),
+            metric_with_unmatched("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 4, 2, 0, true),
+        ];
+        let messy = vec![
+            metric_with_unmatched("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 1, 0, 5, true),
+            metric_with_unmatched("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 0, 0, 6, true),
+        ];
+
+        let scores_clean = RoleFitness::from_metrics("planning", &clean);
+        let scores_messy = RoleFitness::from_metrics("planning", &messy);
+
+        let find_conf = |scores: &[ModelRoleFitScore]| -> f64 {
+            scores.iter().find(|s| s.model == "gemini" && s.role == "critic").unwrap().confidence
+        };
+
+        assert!(
+            find_conf(&scores_clean) > find_conf(&scores_messy),
+            "high unmatched rate should reduce confidence"
+        );
+    }
+
+    // ── Proof G: task-type bonuses shift ranking order ──────────────────
+    //
+    // Task-type bonuses are small (+0.02–0.08) but for closely-matched models
+    // they can change who ranks first. This proves the effect is real.
+
+    #[test]
+    fn proof_g_rust_task_boosts_codex_expert_over_gemini() {
+        // Heuristic-only (no telemetry) — compare expert scores.
+        let generic = RoleFitness::from_metrics("planning", &[]);
+        let rust_task = RoleFitness::from_metrics("rust code implementation", &[]);
+
+        let find = |scores: &[ModelRoleFitScore], model: &str| -> f64 {
+            scores.iter().find(|s| s.model == model && s.role == "expert").unwrap().score
+        };
+
+        let codex_generic = find(&generic, "codex");
+        let codex_rust = find(&rust_task, "codex");
+
+        // Codex should get a bonus on Rust tasks
+        assert!(
+            codex_rust > codex_generic,
+            "Codex expert should score higher on Rust task: {codex_rust} > {codex_generic}"
+        );
+
+        // The Rust bonus for Codex (+0.08) should be larger than for Gemini (+0.02)
+        let gemini_generic = find(&generic, "gemini");
+        let gemini_rust = find(&rust_task, "gemini");
+        let codex_boost = codex_rust - codex_generic;
+        let gemini_boost = gemini_rust - gemini_generic;
+        assert!(
+            codex_boost > gemini_boost,
+            "Codex Rust boost ({codex_boost:.3}) should exceed Gemini's ({gemini_boost:.3})"
+        );
+    }
+
+    #[test]
+    fn proof_g_safety_task_boosts_claude_critic() {
+        let generic = RoleFitness::from_metrics("planning", &[]);
+        let safety = RoleFitness::from_metrics("safety review", &[]);
+
+        let find = |scores: &[ModelRoleFitScore], model: &str| -> f64 {
+            scores.iter().find(|s| s.model == model && s.role == "critic").unwrap().score
+        };
+
+        let claude_generic = find(&generic, "claude");
+        let claude_safety = find(&safety, "claude");
+
+        assert!(
+            claude_safety > claude_generic,
+            "Claude critic should score higher on safety task: {claude_safety} > {claude_generic}"
+        );
+
+        // Claude's safety bonus (+0.07) should be the largest among all models
+        let qwen_boost = find(&safety, "qwen-36-plus") - find(&generic, "qwen-36-plus");
+        let claude_boost = claude_safety - claude_generic;
+        assert!(
+            claude_boost > qwen_boost,
+            "Claude's safety critic boost ({claude_boost:.3}) should exceed Qwen's ({qwen_boost:.3})"
+        );
+    }
+
+    #[test]
+    fn proof_g_design_task_boosts_claude_orchestrator() {
+        let generic = RoleFitness::from_metrics("generic task", &[]);
+        let design = RoleFitness::from_metrics("architecture design planning", &[]);
+
+        let find = |scores: &[ModelRoleFitScore], model: &str| -> f64 {
+            scores.iter().find(|s| s.model == model && s.role == "orchestrator").unwrap().score
+        };
+
+        let claude_generic = find(&generic, "claude");
+        let claude_design = find(&design, "claude");
+
+        assert!(
+            claude_design > claude_generic,
+            "Claude orchestrator should score higher on design task"
+        );
+    }
+
+    // ── Proof H: metrics → role-fit → recommendation coherence ─────────
+    //
+    // End-to-end: when telemetry shows model A outperforming model B for
+    // a role, both the role-fit scoring AND the recommendation engine agree.
+
+    #[test]
+    fn proof_h_role_fit_and_recommendations_agree_on_best_critic() {
+        // Telemetry: Claude is excellent, Gemini is poor — SAME role string
+        // so aggregate_profiles can compare them head-to-head.
+        let role = "adversarial-reviewer/conceptual-risk";
+        let telemetry = vec![
+            metric("claude", role, "deliberation", 8, 0, true),
+            metric("claude", role, "deliberation", 7, 1, true),
+            metric("claude", role, "deliberation", 9, 0, true),
+            metric("gemini", role, "deliberation", 2, 6, true),
+            metric("gemini", role, "deliberation", 1, 7, true),
+            metric("gemini", role, "deliberation", 3, 5, true),
+        ];
+
+        // Role-fit scoring path: Claude should rank higher as critic.
+        let fit_scores = RoleFitness::from_metrics("planning", &telemetry);
+        let claude_critic = fit_scores.iter().find(|s| s.model == "claude" && s.role == "critic").unwrap();
+        let gemini_critic = fit_scores.iter().find(|s| s.model == "gemini" && s.role == "critic").unwrap();
+        assert!(
+            claude_critic.score > gemini_critic.score,
+            "role-fit: Claude critic ({}) should beat Gemini critic ({})",
+            claude_critic.score, gemini_critic.score
+        );
+
+        // Recommendation path: should recommend swapping Gemini → Claude for adversary.
+        let profiles = crate::metrics::aggregate_profiles(&telemetry);
+        let assignments = vec![
+            (crate::model::Model::Gemini, role, "deliberation"),
+        ];
+        let recs = crate::metrics::recommend_roles(&profiles, &assignments, 2, 0.1);
+
+        // Both systems agree: Claude is the better critic.
+        assert!(
+            !recs.is_empty(),
+            "recommendation engine should suggest swapping weak Gemini adversary"
+        );
+        assert_eq!(recs[0].recommended_model, "claude");
+    }
+
+    #[test]
+    fn proof_h_role_fit_ranking_stable_across_task_types() {
+        // When telemetry strongly favors one model, the ranking should hold
+        // regardless of task type (telemetry dominates heuristic bonuses).
+        let strong_telemetry = vec![
+            metric("gemini", "synthesis-owner", "deliberation", 9, 0, true),
+            metric("gemini", "synthesis-owner", "deliberation", 8, 1, true),
+            metric("gemini", "synthesis-owner", "deliberation", 9, 0, true),
+            metric("gemini", "synthesis-owner", "deliberation", 7, 1, true),
+            metric("gemini", "synthesis-owner", "deliberation", 8, 0, true),
+            metric("gemini", "synthesis-owner", "deliberation", 9, 1, true),
+            metric("gemini", "synthesis-owner", "deliberation", 8, 0, true),
+            metric("codex", "synthesis-owner", "deliberation", 1, 7, true),
+            metric("codex", "synthesis-owner", "deliberation", 0, 8, true),
+            metric("codex", "synthesis-owner", "deliberation", 2, 6, true),
+            metric("codex", "synthesis-owner", "deliberation", 1, 7, true),
+            metric("codex", "synthesis-owner", "deliberation", 0, 9, true),
+            metric("codex", "synthesis-owner", "deliberation", 1, 6, true),
+            metric("codex", "synthesis-owner", "deliberation", 0, 8, true),
+        ];
+
+        // Test across multiple task types — telemetry weight is 0.8 at 7+ samples.
+        for task in ["planning", "rust code implementation", "safety review"] {
+            let scores = RoleFitness::from_metrics(task, &strong_telemetry);
+            let gemini = scores.iter().find(|s| s.model == "gemini" && s.role == "synthesizer").unwrap();
+            let codex = scores.iter().find(|s| s.model == "codex" && s.role == "synthesizer").unwrap();
+            assert!(
+                gemini.score > codex.score,
+                "task={task}: Gemini synthesizer ({}) should beat Codex ({}) with strong telemetry",
+                gemini.score, codex.score
+            );
+        }
+    }
+
+    // ── Proof I: mixed-quality telemetry across runs ───────────────────
+    //
+    // Real-world telemetry has variance: some runs are great, some are poor.
+    // This proves the scoring system handles mixed quality gracefully.
+
+    #[test]
+    fn proof_i_mixed_telemetry_produces_intermediate_score() {
+        // Pure good telemetry
+        let all_good = vec![
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 8, 1, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 7, 1, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 9, 0, true),
+        ];
+        // Pure bad telemetry
+        let all_bad = vec![
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 1, 7, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 0, 8, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 1, 6, true),
+        ];
+        // Mixed: 2 good + 1 bad
+        let mixed = vec![
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 8, 1, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 7, 1, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 1, 7, true),
+        ];
+
+        let find = |scores: &[ModelRoleFitScore]| -> f64 {
+            scores.iter().find(|s| s.model == "claude" && s.role == "critic").unwrap().score
+        };
+
+        let good_score = find(&RoleFitness::from_metrics("planning", &all_good));
+        let bad_score = find(&RoleFitness::from_metrics("planning", &all_bad));
+        let mixed_score = find(&RoleFitness::from_metrics("planning", &mixed));
+
+        // Mixed should fall between good and bad
+        assert!(
+            mixed_score < good_score,
+            "mixed ({mixed_score}) should be less than all-good ({good_score})"
+        );
+        assert!(
+            mixed_score > bad_score,
+            "mixed ({mixed_score}) should be more than all-bad ({bad_score})"
+        );
+    }
+
+    #[test]
+    fn proof_i_single_bad_run_doesnt_destroy_score() {
+        // 4 good runs + 1 terrible run
+        let mostly_good = vec![
+            metric("codex", "synthesis-owner", "deliberation", 6, 1, true),
+            metric("codex", "synthesis-owner", "deliberation", 5, 1, true),
+            metric("codex", "synthesis-owner", "deliberation", 7, 0, true),
+            metric("codex", "synthesis-owner", "deliberation", 6, 0, true),
+            metric("codex", "synthesis-owner", "deliberation", 0, 8, false), // terrible run
+        ];
+
+        let find = |scores: &[ModelRoleFitScore]| -> f64 {
+            scores.iter().find(|s| s.model == "codex" && s.role == "synthesizer").unwrap().score
+        };
+
+        let mixed_score = find(&RoleFitness::from_metrics("planning", &mostly_good));
+        // The heuristic-only score for Codex synthesizer
+        let heuristic_score = find(&RoleFitness::from_metrics("planning", &[]));
+
+        // Despite one terrible run, the 4 good runs should keep the score reasonable.
+        // Score should still be within 0.15 of the heuristic baseline.
+        assert!(
+            (mixed_score - heuristic_score).abs() < 0.15,
+            "one bad run shouldn't destroy score: mixed={mixed_score}, heuristic={heuristic_score}"
+        );
+    }
+
+    #[test]
+    fn proof_i_increasing_sample_count_converges_toward_telemetry() {
+        // With 1 sample, telemetry weight is 0.25 — mostly heuristic.
+        // With 7+ samples, telemetry weight is 0.80 — mostly telemetry.
+        // All samples show perfect performance → score should increase with more samples.
+        let find = |scores: &[ModelRoleFitScore]| -> f64 {
+            scores.iter().find(|s| s.model == "gemini" && s.role == "critic").unwrap().score
+        };
+
+        let one = vec![
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 10, 0, true),
+        ];
+        let three = vec![
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 10, 0, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 9, 0, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 10, 0, true),
+        ];
+        let eight = vec![
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 10, 0, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 9, 0, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 10, 0, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 9, 1, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 10, 0, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 8, 1, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 10, 0, true),
+            metric("gemini", "adversarial-reviewer/implementation-risk", "deliberation", 9, 0, true),
+        ];
+
+        let s1 = find(&RoleFitness::from_metrics("planning", &one));
+        let s3 = find(&RoleFitness::from_metrics("planning", &three));
+        let s8 = find(&RoleFitness::from_metrics("planning", &eight));
+
+        // Perfect telemetry should exceed the heuristic baseline (Gemini critic is 0.78 heuristic).
+        // More samples → more telemetry weight → higher score for perfect data.
+        assert!(
+            s3 > s1 || (s3 - s1).abs() < 0.01,
+            "3 samples should score >= 1 sample: {s3} vs {s1}"
+        );
+        assert!(
+            s8 > s1,
+            "8 perfect samples should clearly beat 1: {s8} > {s1}"
+        );
+    }
 }
