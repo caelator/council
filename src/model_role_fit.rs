@@ -562,4 +562,110 @@ mod tests {
         let qwen_critic = qwen_scores.iter().find(|s| s.role == "critic").unwrap();
         assert!(qwen_critic.score > 0.7, "Qwen critic score too low: {}", qwen_critic.score);
     }
+
+    // ── Proof D: role-fit scoring effect-on vs effect-off ────────────
+
+    #[test]
+    fn proof_d_telemetry_shifts_scores_vs_heuristic_only() {
+        // Effect-OFF: no telemetry → pure heuristic scoring.
+        let heuristic_only = RoleFitness::from_metrics("planning", &[]);
+
+        // Effect-ON: inject telemetry showing Gemini is an excellent critic
+        // and Claude is a poor critic (opposite of heuristics).
+        let telemetry = vec![
+            metric("gemini", "adversarial-reviewer/conceptual-risk", "deliberation", 8, 0, true),
+            metric("gemini", "adversarial-reviewer/conceptual-risk", "deliberation", 7, 1, true),
+            metric("gemini", "adversarial-reviewer/conceptual-risk", "deliberation", 6, 1, true),
+            metric("gemini", "adversarial-reviewer/conceptual-risk", "deliberation", 9, 0, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 1, 7, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 0, 6, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 1, 5, true),
+            metric("claude", "adversarial-reviewer/conceptual-risk", "deliberation", 0, 8, true),
+        ];
+        let with_telemetry = RoleFitness::from_metrics("planning", &telemetry);
+
+        let find = |scores: &[ModelRoleFitScore], model: &str, role: &str| -> f64 {
+            scores.iter().find(|s| s.model == model && s.role == role).unwrap().score
+        };
+
+        // Heuristic-only: Claude should score higher than Gemini as critic.
+        let h_claude_critic = find(&heuristic_only, "claude", "critic");
+        let h_gemini_critic = find(&heuristic_only, "gemini", "critic");
+        assert!(
+            h_claude_critic > h_gemini_critic,
+            "heuristic: Claude ({h_claude_critic}) should beat Gemini ({h_gemini_critic}) as critic"
+        );
+
+        // With telemetry: Gemini's excellent critique data should boost its score,
+        // and Claude's poor critique data should drop its score.
+        let t_claude_critic = find(&with_telemetry, "claude", "critic");
+        let t_gemini_critic = find(&with_telemetry, "gemini", "critic");
+
+        // The telemetry should measurably shift scores.
+        assert!(
+            t_gemini_critic > h_gemini_critic,
+            "telemetry should boost Gemini critic: {t_gemini_critic} > {h_gemini_critic}"
+        );
+        assert!(
+            t_claude_critic < h_claude_critic,
+            "telemetry should reduce Claude critic: {t_claude_critic} < {h_claude_critic}"
+        );
+    }
+
+    #[test]
+    fn proof_d_more_telemetry_increases_confidence() {
+        let one_sample = vec![
+            metric("codex", "synthesis-owner", "deliberation", 5, 1, true),
+        ];
+        let many_samples = vec![
+            metric("codex", "synthesis-owner", "deliberation", 5, 1, true),
+            metric("codex", "synthesis-owner", "deliberation", 6, 0, true),
+            metric("codex", "synthesis-owner", "deliberation", 4, 2, true),
+            metric("codex", "synthesis-owner", "deliberation", 5, 1, true),
+            metric("codex", "synthesis-owner", "deliberation", 7, 0, true),
+            metric("codex", "synthesis-owner", "deliberation", 6, 1, true),
+            metric("codex", "synthesis-owner", "deliberation", 5, 0, true),
+        ];
+
+        let scores_1 = RoleFitness::from_metrics("planning", &one_sample);
+        let scores_7 = RoleFitness::from_metrics("planning", &many_samples);
+
+        let find_confidence = |scores: &[ModelRoleFitScore]| -> f64 {
+            scores.iter()
+                .find(|s| s.model == "codex" && s.role == "synthesizer")
+                .unwrap()
+                .confidence
+        };
+
+        let conf_1 = find_confidence(&scores_1);
+        let conf_7 = find_confidence(&scores_7);
+        assert!(
+            conf_7 > conf_1,
+            "more samples should increase confidence: {conf_7} > {conf_1}"
+        );
+    }
+
+    #[test]
+    fn proof_d_parse_failures_reduce_score() {
+        let good_parse = vec![
+            metric("gemini", "solution-scout", "brainstorming", 4, 1, true),
+            metric("gemini", "solution-scout", "brainstorming", 5, 0, true),
+        ];
+        let bad_parse = vec![
+            metric("gemini", "solution-scout", "brainstorming", 4, 1, false),
+            metric("gemini", "solution-scout", "brainstorming", 5, 0, false),
+        ];
+
+        let scores_good = RoleFitness::from_metrics("planning", &good_parse);
+        let scores_bad = RoleFitness::from_metrics("planning", &bad_parse);
+
+        let find = |scores: &[ModelRoleFitScore]| -> f64 {
+            scores.iter().find(|s| s.model == "gemini" && s.role == "expert").unwrap().score
+        };
+
+        assert!(
+            find(&scores_good) > find(&scores_bad),
+            "parse failures should reduce score"
+        );
+    }
 }

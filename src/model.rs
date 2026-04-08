@@ -350,4 +350,104 @@ mod tests {
         let back: Model = serde_json::from_str(&json).unwrap();
         assert_eq!(back, m);
     }
+
+    // ── Proof B: Qwen lane runtime path goes through provider layer ──
+
+    #[test]
+    fn proof_b_qwen_dispatches_to_openrouter_provider() {
+        // Qwen36Plus must resolve to a remote model with an OpenRouter model ID.
+        let model = Model::Qwen36Plus;
+        assert!(model.is_remote(), "Qwen must be remote");
+        assert_eq!(
+            model.openrouter_model_id(),
+            Some("qwen/qwen3.6-plus"),
+            "Qwen must resolve to openrouter model ID"
+        );
+        // This means run_model() will take the openrouter path, not the local CLI path.
+    }
+
+    #[test]
+    fn proof_b_all_free_models_route_through_provider() {
+        // Every model from all_free_models() must be remote → provider-dispatched.
+        for model in Model::all_free_models() {
+            assert!(
+                model.is_remote(),
+                "{} should be remote",
+                model.name()
+            );
+            assert!(
+                model.openrouter_model_id().is_some(),
+                "{} should have an openrouter model ID",
+                model.name()
+            );
+            // Verify the model ID is in the free registry (provider gate will pass).
+            let model_id = model.openrouter_model_id().unwrap();
+            assert!(
+                provider::is_free_model(model_id),
+                "{} (model_id={}) should be in the free registry",
+                model.name(),
+                model_id
+            );
+        }
+    }
+
+    #[test]
+    fn proof_b_qwen_free_gate_allows_qwen_model_id() {
+        // End-to-end: the model ID that Qwen resolves to passes the free gate.
+        let model_id = Model::Qwen36Plus.openrouter_model_id().unwrap();
+        assert!(
+            provider::is_free_model(model_id),
+            "Qwen's resolved model ID should pass free gate"
+        );
+    }
+
+    #[test]
+    fn proof_b_openrouter_free_variant_gate_pass() {
+        // Every OpenRouterFree variant's ID must pass the free gate.
+        for entry in provider::free_model_registry() {
+            let model = if entry.id == "qwen/qwen3.6-plus" {
+                Model::Qwen36Plus
+            } else {
+                Model::OpenRouterFree(entry.id)
+            };
+            let model_id = model.openrouter_model_id().unwrap();
+            assert!(
+                provider::is_free_model(model_id),
+                "model {} (id={}) must pass free gate",
+                model.name(),
+                model_id
+            );
+        }
+    }
+
+    // ── Proof B: roster override resolution ─────────────────────────
+
+    #[test]
+    fn proof_b_roster_override_resolves_free_model_by_slug() {
+        // Simulates what resolve_roster_model does: Model::from_name with a slug.
+        let model = Model::from_name("deepseek-r1-0528");
+        assert!(model.is_some(), "slug should resolve to a model");
+        let model = model.unwrap();
+        assert!(model.is_remote());
+        assert_eq!(
+            model.openrouter_model_id(),
+            Some("deepseek/deepseek-r1-0528:free")
+        );
+    }
+
+    #[test]
+    fn proof_b_roster_override_resolves_free_model_by_full_id() {
+        let model = Model::from_name("meta-llama/llama-4-maverick:free");
+        assert!(model.is_some(), "full ID should resolve");
+        let model = model.unwrap();
+        assert!(model.is_remote());
+        assert!(provider::is_free_model(model.openrouter_model_id().unwrap()));
+    }
+
+    #[test]
+    fn proof_b_roster_override_rejects_paid_model_name() {
+        // A paid model name must NOT resolve → roster stays on default.
+        assert!(Model::from_name("openai/gpt-4o").is_none());
+        assert!(Model::from_name("gpt-4o").is_none());
+    }
 }

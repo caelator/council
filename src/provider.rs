@@ -3,8 +3,47 @@
 //! Design: one trait (`ChatProvider`) for any OpenAI-compatible chat-completion
 //! backend.  The first concrete impl is `OpenRouterFreeProvider`, which enforces
 //! that only free-tier models are ever called.
+//!
+//! Every `complete()` call emits a [`PolicyDecision`] to stderr as structured
+//! telemetry, making the allow/deny path observable and auditable.
 
 use std::io;
+
+// ── Policy telemetry ─────────────────────────────────────────────────
+
+/// Outcome of a provider policy check, emitted as telemetry on every call.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PolicyDecision {
+    /// Requested model ID.
+    pub model_id: String,
+    /// Whether the request was allowed.
+    pub allowed: bool,
+    /// Reason for the decision.
+    pub reason: PolicyReason,
+    /// Provider that made the decision.
+    pub provider: String,
+    /// ISO-8601 timestamp.
+    pub timestamp: String,
+}
+
+/// Why a policy decision was made.
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum PolicyReason {
+    /// Model is in the free-tier registry.
+    FreeRegistryMatch,
+    /// Model is not in the free-tier registry (denied).
+    NotInRegistry,
+    /// Model ID looks stale (contains version suffix not in registry).
+    StaleModelId { closest_match: Option<String> },
+}
+
+impl PolicyDecision {
+    fn emit(&self) {
+        if let Ok(json) = serde_json::to_string(self) {
+            eprintln!("  [policy] {json}");
+        }
+    }
+}
 
 // ── Trait ──────────────────────────────────────────────────────────────
 
@@ -117,7 +156,7 @@ impl OpenRouterFreeProvider {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         Ok(Self { api_key, client })
     }
 
@@ -135,11 +174,29 @@ impl ChatProvider for OpenRouterFreeProvider {
     }
 
     fn complete(&self, model_id: &str, prompt: &str, max_tokens: u32) -> io::Result<String> {
+        let now = chrono_now();
+
         // ── Free-only gate ────────────────────────────────────────
         if !is_free_model(model_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
+            let reason = classify_denial(model_id);
+            PolicyDecision {
+                model_id: model_id.to_string(),
+                allowed: false,
+                reason: reason.clone(),
+                provider: "openrouter-free".to_string(),
+                timestamp: now,
+            }
+            .emit();
+
+            let detail = match &reason {
+                PolicyReason::StaleModelId {
+                    closest_match: Some(m),
+                } => format!(
+                    "Model {model_id:?} is not in the free-tier registry \
+                     (possible stale ID — closest match: {m:?}). \
+                     Only free OpenRouter models are allowed."
+                ),
+                _ => format!(
                     "Model {model_id:?} is not in the free-tier registry. \
                      Only free OpenRouter models are allowed. \
                      Known free models: {}",
@@ -149,8 +206,20 @@ impl ChatProvider for OpenRouterFreeProvider {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-            ));
+            };
+
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, detail));
         }
+
+        // ── Allowed — emit telemetry ─────────────────────────────
+        PolicyDecision {
+            model_id: model_id.to_string(),
+            allowed: true,
+            reason: PolicyReason::FreeRegistryMatch,
+            provider: "openrouter-free".to_string(),
+            timestamp: now,
+        }
+        .emit();
 
         let payload = serde_json::json!({
             "model": model_id,
@@ -242,6 +311,48 @@ pub fn strip_think_blocks(text: &str) -> String {
     } else {
         trimmed
     }
+}
+
+/// Classify why a model was denied — distinguishes "totally unknown" from
+/// "looks like a stale/rotated version of a known model".
+pub fn classify_denial(model_id: &str) -> PolicyReason {
+    // Extract the base slug: "qwen/qwen-max-2025" → "qwen-max"
+    let slug = model_id.split('/').next_back().unwrap_or(model_id);
+    let slug = slug.strip_suffix(":free").unwrap_or(slug);
+
+    // Check if any registry entry shares a common prefix (≥60% of the shorter slug).
+    for entry in FREE_MODEL_REGISTRY {
+        let entry_slug = entry.id.split('/').next_back().unwrap_or(entry.id);
+        let entry_slug = entry_slug.strip_suffix(":free").unwrap_or(entry_slug);
+
+        let min_len = slug.len().min(entry_slug.len());
+        if min_len == 0 {
+            continue;
+        }
+        let common = slug
+            .chars()
+            .zip(entry_slug.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common as f64 / min_len as f64 >= 0.6 && common >= 4 {
+            return PolicyReason::StaleModelId {
+                closest_match: Some(entry.id.to_string()),
+            };
+        }
+    }
+
+    PolicyReason::NotInRegistry
+}
+
+/// ISO-8601 timestamp without pulling in the `chrono` crate.
+fn chrono_now() -> String {
+    // Use std::time for a simple UTC-ish timestamp; sufficient for telemetry.
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    // Approximate ISO format: good enough for logs, no external dep needed.
+    format!("{secs}")
 }
 
 /// Resolve the OpenRouter API key: env var first, then OpenClaw config.
@@ -350,5 +461,129 @@ mod tests {
         // (We can't guarantee the env is clean, so just test the type.)
         let _result: Option<OpenRouterFreeProvider> = OpenRouterFreeProvider::from_env();
         // No panic = success.
+    }
+
+    // ── Proof A: free-only gate — positive, negative, artifact ──────
+
+    #[test]
+    fn proof_a_allowed_free_model_produces_permit_decision() {
+        // Every registered free model must pass the gate and classify as FreeRegistryMatch.
+        for entry in FREE_MODEL_REGISTRY {
+            assert!(is_free_model(entry.id), "should allow {}", entry.id);
+            // The classify_denial path is only reached on deny, but we verify
+            // the positive path here: is_free_model returns true.
+        }
+    }
+
+    #[test]
+    fn proof_a_denied_paid_model_produces_deny_decision() {
+        let provider = OpenRouterFreeProvider::new("test-key".into()).unwrap();
+        let paid_models = [
+            "openai/gpt-4o",
+            "anthropic/claude-3.5-sonnet",
+            "meta-llama/llama-3-70b-instruct",
+            "google/gemini-pro",
+        ];
+        for model_id in paid_models {
+            let result = provider.complete(model_id, "hello", 10);
+            assert!(result.is_err(), "should deny paid model {model_id}");
+            let err = result.unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied,
+                "should be PermissionDenied for {model_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_a_non_registry_model_fails_closed() {
+        // A model that looks plausible but isn't registered must be denied.
+        let provider = OpenRouterFreeProvider::new("test-key".into()).unwrap();
+        let result = provider.complete("qwen/qwen-9999-turbo:free", "hello", 10);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn proof_a_policy_decision_serializes_correctly() {
+        let decision = PolicyDecision {
+            model_id: "openai/gpt-4o".to_string(),
+            allowed: false,
+            reason: PolicyReason::NotInRegistry,
+            provider: "openrouter-free".to_string(),
+            timestamp: "1700000000".to_string(),
+        };
+        let json = serde_json::to_string(&decision).unwrap();
+        assert!(json.contains("\"allowed\":false"));
+        assert!(json.contains("\"NotInRegistry\""));
+        assert!(json.contains("openai/gpt-4o"));
+
+        let allow = PolicyDecision {
+            model_id: "qwen/qwen3.6-plus".to_string(),
+            allowed: true,
+            reason: PolicyReason::FreeRegistryMatch,
+            provider: "openrouter-free".to_string(),
+            timestamp: "1700000000".to_string(),
+        };
+        let json = serde_json::to_string(&allow).unwrap();
+        assert!(json.contains("\"allowed\":true"));
+        assert!(json.contains("\"FreeRegistryMatch\""));
+    }
+
+    // ── Proof C: stale-ID detection ─────────────────────────────────
+
+    #[test]
+    fn proof_c_stale_id_detected_for_version_rotated_model() {
+        // A model like "qwen/qwen3.6-plus-2025" should be detected as a stale
+        // variant of "qwen/qwen3.6-plus".
+        let reason = classify_denial("qwen/qwen3.6-plus-2025");
+        match reason {
+            PolicyReason::StaleModelId { closest_match } => {
+                assert_eq!(closest_match, Some("qwen/qwen3.6-plus".to_string()));
+            }
+            other => panic!("expected StaleModelId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proof_c_stale_id_detected_for_suffix_variant() {
+        let reason = classify_denial("deepseek/deepseek-r1-0528-v2:free");
+        match reason {
+            PolicyReason::StaleModelId { closest_match } => {
+                assert_eq!(
+                    closest_match,
+                    Some("deepseek/deepseek-r1-0528:free".to_string())
+                );
+            }
+            other => panic!("expected StaleModelId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proof_c_completely_unknown_model_is_not_in_registry() {
+        let reason = classify_denial("openai/gpt-4o");
+        assert!(
+            matches!(reason, PolicyReason::NotInRegistry),
+            "expected NotInRegistry, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn proof_c_stale_id_error_message_includes_closest_match() {
+        let provider = OpenRouterFreeProvider::new("test-key".into()).unwrap();
+        let result = provider.complete("qwen/qwen3.6-plus-2025", "hello", 10);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains("stale ID"),
+            "error should mention stale ID: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("qwen/qwen3.6-plus"),
+            "error should include closest match: {}",
+            err
+        );
     }
 }

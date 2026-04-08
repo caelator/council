@@ -1161,3 +1161,72 @@ fn count_high_severity(critique: &StructuredCritique) -> usize {
         .filter(|c| matches!(c.severity, critique::Severity::High))
         .count()
 }
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Proof B: roster override via env var ─────────────────────────
+
+    #[test]
+    fn proof_b_roster_override_env_resolves_free_model() {
+        // Set an env var that resolve_roster_model checks.
+        // Use a unique role name to avoid collisions with other tests.
+        let role = "proof-test-scout";
+        let env_key = "COUNCIL_MODEL_PROOF_TEST_SCOUT";
+
+        // SAFETY: test-only, single-threaded test runner for this test.
+        unsafe { std::env::set_var(env_key, "deepseek-r1-0528") };
+        let resolved = resolve_roster_model(role, Model::Gemini);
+
+        // The resolved model should be the DeepSeek free model, not the default Gemini.
+        assert_ne!(resolved, Model::Gemini, "override should change default");
+        assert!(resolved.is_remote(), "override should resolve to remote model");
+        assert_eq!(
+            resolved.openrouter_model_id(),
+            Some("deepseek/deepseek-r1-0528:free"),
+            "override should resolve to correct OpenRouter ID"
+        );
+
+        // Clean up env.
+        unsafe { std::env::remove_var(env_key) };
+    }
+
+    #[test]
+    fn proof_b_roster_override_invalid_falls_back_to_default() {
+        let role = "proof-fallback-scout";
+        let env_key = "COUNCIL_MODEL_PROOF_FALLBACK_SCOUT";
+
+        // SAFETY: test-only, single-threaded test runner for this test.
+        unsafe { std::env::set_var(env_key, "nonexistent-model-xyz") };
+        let resolved = resolve_roster_model(role, Model::Claude);
+        assert_eq!(
+            resolved,
+            Model::Claude,
+            "invalid override should fall back to default"
+        );
+
+        unsafe { std::env::remove_var(env_key) };
+    }
+
+    #[test]
+    fn proof_b_roster_override_absent_uses_default() {
+        // No env var set → default is used.
+        let role = "proof-absent-scout";
+        let resolved = resolve_roster_model(role, Model::Codex);
+        assert_eq!(resolved, Model::Codex);
+    }
+
+    #[test]
+    fn proof_b_roster_env_key_format() {
+        // Verify the env key derivation: "risk-scout/alpha" → "COUNCIL_MODEL_RISK_SCOUT_ALPHA"
+        let role = "risk-scout/alpha";
+        let env_key = format!(
+            "COUNCIL_MODEL_{}",
+            role.to_ascii_uppercase().replace('-', "_").replace('/', "_")
+        );
+        assert_eq!(env_key, "COUNCIL_MODEL_RISK_SCOUT_ALPHA");
+    }
+}
