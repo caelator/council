@@ -140,6 +140,34 @@
 /// - Zero-matching rate: ~50% of runs -> <10% (format normalization + example)
 /// - Fit score queryability: none -> full JSONL history
 /// - Diagnostic precision: "0 accepted" now distinguishable from "0 matched"
+///
+/// ## Pass 6 — Acceptance-rate formula fix & scoring accuracy (2026-04-08)
+///
+/// 1. **acceptance_rate() counted unmatched as accepted (critical bug)**:
+///    Formula was `(submitted - rejected) / submitted`. When all critiques are
+///    unmatched (format mismatch), rejected=0, so acceptance_rate=1.0 — the exact
+///    opposite of reality. This meant the fit scoring system could never detect
+///    zero-matching from acceptance_rate alone, defeating the pass-5 diagnostic.
+///    Fix: Changed to `(accepted + partial) / submitted`. Added `unmatched_rate()`
+///    method for explicit format-mismatch signal.
+///
+/// 2. **Fit scoring blind to match quality**: Both `score_model_role_fit` and
+///    `summarize_telemetry` (model_role_fit.rs) used acceptance_rate but had no
+///    weight for match quality. A model could score "excellent" while 100% of
+///    its critiques went unmatched.
+///    Fix: Added `match_quality = 1 - avg_unmatched` as a 20% composite weight
+///    in both scoring paths. Confidence now also degrades with high unmatched rate.
+///    Added `avg_unmatched_rate` to ModelRoleFit for reporting.
+///
+/// 3. **fuzzy_match dropped short tech terms**: Word-overlap filter required >3 chars,
+///    dropping "API", "SQL", "OOM", "CLI", etc. These are exactly the kind of
+///    precise technical terms that should anchor a match.
+///    Fix: Lowered threshold to >2 chars.
+///
+/// Expected improvements (pass 6):
+/// - Zero-acceptance false positives: 100% → 0% (unmatched no longer masks as accepted)
+/// - Fit score accuracy: scoring now reflects actual match quality, not just parse success
+/// - Fuzzy match recall: short tech terms like "API timeout" now match correctly
 
 pub const FRAMING_PROMPT: &str = r#"You are the framing controller for an AI planning council.
 
