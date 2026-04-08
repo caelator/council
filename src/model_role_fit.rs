@@ -36,7 +36,7 @@ impl RoleFitness {
         }
 
         let mut scores = Vec::new();
-        for model in ["claude", "gemini", "codex"] {
+        for model in ["claude", "gemini", "codex", "qwen-36-plus"] {
             for role in ["orchestrator", "critic", "expert", "synthesizer"] {
                 let telemetry = by_pair
                     .get(&(model.to_string(), role.to_string()))
@@ -189,6 +189,8 @@ fn capability_fit(model: &str, role: &str, task_type: &str) -> f64 {
         "critic" if task.contains("safety") || task.contains("review") || task.contains("risk") => {
             if model == "claude" {
                 0.07
+            } else if model == "qwen-36-plus" {
+                0.06 // reasoning model, strong at risk analysis
             } else if model == "gemini" {
                 0.04
             } else {
@@ -272,6 +274,17 @@ fn capability_profile(model: &str) -> CapabilityProfile {
             synthesis: 0.91,
             domain: 0.88,
             implementation: 0.94,
+        },
+        "qwen-36-plus" => CapabilityProfile {
+            intelligence: 0.88,
+            context: 0.95,  // 1M token context window
+            speed: 0.65,    // remote API, free tier
+            cost_efficiency: 1.0, // free tier
+            planning: 0.85,
+            critique: 0.88,  // reasoning model
+            synthesis: 0.80,
+            domain: 0.84,
+            implementation: 0.78,
         },
         _ => CapabilityProfile {
             intelligence: 0.5,
@@ -436,5 +449,19 @@ mod tests {
             .unwrap();
         assert!(orchestrator.score > gemini_orch.score);
         assert_eq!(orchestrator.sample_count, 0);
+    }
+
+    #[test]
+    fn qwen_included_in_role_fitness_scoring() {
+        let scores = RoleFitness::from_metrics("planning", &[]);
+        let qwen_scores: Vec<_> = scores.iter().filter(|s| s.model == "qwen-36-plus").collect();
+        // Qwen should have entries for all 4 canonical roles
+        assert_eq!(qwen_scores.len(), 4, "Qwen should have 4 role scores");
+        for s in &qwen_scores {
+            assert!(s.score > 0.0 && s.score <= 1.0, "score out of range: {}", s.score);
+        }
+        // Qwen should score well as critic (reasoning model)
+        let qwen_critic = qwen_scores.iter().find(|s| s.role == "critic").unwrap();
+        assert!(qwen_critic.score > 0.7, "Qwen critic score too low: {}", qwen_critic.score);
     }
 }

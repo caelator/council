@@ -154,6 +154,7 @@ fn main() -> anyhow::Result<()> {
         (Model::Claude, model::check_available(Model::Claude)),
         (Model::Codex, model::check_available(Model::Codex)),
         (Model::Gemma31B, model::check_available(Model::Gemma31B)),
+        (Model::Qwen36Plus, model::check_available(Model::Qwen36Plus)),
     ];
     for (m, available) in &models_available {
         if *available {
@@ -607,7 +608,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Telemetry ─────────────────────────────────────────────────────
     let ts = iso_now();
-    let models_used: Vec<String> = [Model::Gemini, Model::Claude, Model::Codex, Model::Gemma31B]
+    let models_used: Vec<String> = [Model::Gemini, Model::Claude, Model::Codex, Model::Gemma31B, Model::Qwen36Plus]
         .iter()
         .filter(|m| model::check_available(**m))
         .map(|m| m.name().into())
@@ -842,6 +843,34 @@ fn run_brainstorm_stage(
         "brainstorming",
     ));
 
+    // Qwen 3.6 Plus contributes risk/reasoning analysis via OpenRouter
+    eprintln!("  → Qwen36Plus: risk-scout (contribute)");
+    let qwen_contrib_prompt = fmt_prompt(
+        phase::BRAINSTORM_CONTRIBUTE_PROMPT,
+        &[
+            ("role", "risk-scout"),
+            (
+                "role_description",
+                "Identify failure modes, edge cases, and what could go wrong with this plan. Use chain-of-thought reasoning to find subtle issues",
+            ),
+            ("framing", framing),
+            ("plan", &seed_plan),
+            ("task", &config.task),
+        ],
+    );
+    let qwen_contributions = run_phase_model(
+        Model::Qwen36Plus,
+        &qwen_contrib_prompt,
+        &config.workdir,
+        stage1_dir,
+        "qwen-contribute",
+    );
+    personas.push(persona_assignment(
+        Model::Qwen36Plus,
+        "risk-scout",
+        "brainstorming",
+    ));
+
     // Record brainstorm contributor metrics
     let ts = iso_now();
     run_metrics.push(collect_output_metrics(
@@ -880,6 +909,15 @@ fn run_brainstorm_stage(
         gemma_contributions.len() as u32,
         gemma_contributions.len() > 20,
     ));
+    run_metrics.push(collect_output_metrics(
+        &config.run_id,
+        &ts,
+        Model::Qwen36Plus,
+        "risk-scout",
+        "brainstorming",
+        qwen_contributions.len() as u32,
+        qwen_contributions.len() > 20,
+    ));
 
     // Synthesize
     eprintln!("  → Gemini: synthesizing contributions");
@@ -888,7 +926,8 @@ fn run_brainstorm_stage(
          Original plan:\n{seed_plan}\n\n\
          Elegance contributions:\n{claude_contributions}\n\n\
          Feasibility contributions:\n{codex_contributions}\n\n\
-         Risk/failure-mode contributions:\n{gemma_contributions}\n\n\
+         Risk/failure-mode contributions (Gemma):\n{gemma_contributions}\n\n\
+         Risk/failure-mode contributions (Qwen):\n{qwen_contributions}\n\n\
          Integrate the valuable suggestions. Produce the revised complete plan.\n\
          Mark sections that changed with [CHANGED] tags."
     );
