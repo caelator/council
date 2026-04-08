@@ -12,6 +12,7 @@ use std::io;
 ///
 /// Implementations own their HTTP client, credentials, and any policy
 /// enforcement (e.g. free-only filtering).
+#[allow(dead_code)] // Public API — consumed by model.rs now, more callers expected
 pub trait ChatProvider: Send + Sync {
     /// Human-readable provider name (e.g. "openrouter-free").
     fn name(&self) -> &str;
@@ -73,6 +74,7 @@ const FREE_MODEL_REGISTRY: &[FreeModelEntry] = &[
 ];
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Public API fields — used by registry consumers and tests
 pub struct FreeModelEntry {
     /// OpenRouter model identifier (e.g. "qwen/qwen3.6-plus").
     pub id: &'static str,
